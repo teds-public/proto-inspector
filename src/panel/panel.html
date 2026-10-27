@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Proto Inspector</title>
+    <link rel="stylesheet" href="panel.css" />
+  </head>
+  <body>
+    <header class="toolbar">
+      <div class="toolbar__brand">
+        <span class="brand__dot" id="status-dot" data-state="idle"></span>
+        <strong>Proto Inspector</strong>
+        <span class="toolbar__status" id="status-text">Idle</span>
+      </div>
+      <div class="toolbar__actions">
+        <button type="button" id="btn-start" class="btn btn--primary">Start capture</button>
+        <button type="button" id="btn-stop" class="btn" disabled>Stop</button>
+        <button type="button" id="btn-pause" class="btn" disabled>Pause</button>
+        <button type="button" id="btn-clear" class="btn">Clear</button>
+        <button type="button" id="btn-export" class="btn">Export JSON</button>
+        <button type="button" id="btn-settings" class="btn" aria-expanded="false">Settings</button>
+      </div>
+    </header>
+
+    <div class="notice notice--warning" id="attach-warning" hidden>
+      Attaching the debugger shows Chrome's "debugging this browser" notification and can
+      conflict with other debugging tools on the same tab. Capture only runs on the tab you
+      selected in DevTools.
+    </div>
+    <div class="notice notice--error" id="error-banner" role="alert" hidden></div>
+
+    <section class="settings" id="settings-panel" hidden>
+      <div class="settings__grid">
+        <label class="field">
+          <span class="field__label">Retention limit (messages)</span>
+          <input type="number" id="input-retention" min="100" max="50000" step="100" value="5000" />
+          <span class="field__hint">Oldest messages are dropped first.</span>
+        </label>
+        <label class="field">
+          <span class="field__label">Default message type</span>
+          <input type="text" id="input-default-type" placeholder="package.Message" />
+          <span class="field__hint">Used for frames the envelope does not identify.</span>
+        </label>
+        <label class="field field--checkbox">
+          <input type="checkbox" id="input-auto-decode" checked />
+          <span>Decode automatically with the loaded schema</span>
+        </label>
+      </div>
+
+      <details class="envelope">
+        <summary>Application envelope (optional)</summary>
+        <p class="muted">
+          Use this when the frame is not a bare protobuf message, e.g. a fixed header followed
+          by a message id. The payload that remains must be a plain protobuf message.
+        </p>
+        <div class="settings__grid">
+          <label class="field field--checkbox">
+            <input type="checkbox" id="input-envelope-enabled" />
+            <span>Messages have a fixed envelope</span>
+          </label>
+          <label class="field">
+            <span class="field__label">Header length (bytes)</span>
+            <input type="number" id="input-header-length" min="0" max="64" value="0" />
+          </label>
+          <label class="field">
+            <span class="field__label">Message id encoding</span>
+            <select id="input-id-encoding">
+              <option value="">No message id</option>
+              <option value="uint8">uint8</option>
+              <option value="uint16le">uint16 little-endian</option>
+              <option value="uint16be">uint16 big-endian</option>
+              <option value="uint32le">uint32 little-endian</option>
+              <option value="uint32be">uint32 big-endian</option>
+              <option value="varint">varint</option>
+            </select>
+          </label>
+          <label class="field">
+            <span class="field__label">Message id offset</span>
+            <input type="number" id="input-id-offset" min="0" max="64" value="0" />
+          </label>
+          <label class="field">
+            <span class="field__label">Payload offset (bytes)</span>
+            <input type="number" id="input-payload-offset" min="0" max="64" value="0" />
+          </label>
+        </div>
+        <div class="field">
+          <span class="field__label">Message id → type mapping</span>
+          <textarea id="input-id-mapping" rows="4" spellcheck="false" placeholder="1=game.LoginRequest&#10;2=game.LoginResponse"></textarea>
+          <span class="field__hint">One <code>id=package.Message</code> per line.</span>
+        </div>
+      </details>
+
+      <div class="settings__actions">
+        <button type="button" id="btn-save-settings" class="btn btn--primary">Save settings</button>
+        <span class="muted" id="settings-saved"></span>
+      </div>
+    </section>
+
+    <main class="layout">
+      <aside class="connections" aria-label="WebSocket connections">
+        <div class="pane__header">
+          <h2>Connections</h2>
+          <button type="button" id="btn-schema" class="btn btn--small">Schemas</button>
+        </div>
+        <div class="schema-summary" id="schema-summary">No schema loaded</div>
+        <ul class="connection-list" id="connection-list"></ul>
+        <p class="empty" id="connections-empty">
+          No WebSocket connections yet. Start capture, then open a WebSocket from the page.
+        </p>
+      </aside>
+
+      <section class="messages" aria-label="Messages">
+        <div class="filters">
+          <input type="search" id="filter-search" placeholder="Search URL, type or text…" aria-label="Search messages" />
+          <select id="filter-connection" aria-label="Filter by connection">
+            <option value="">All connections</option>
+          </select>
+          <select id="filter-direction" aria-label="Filter by direction">
+            <option value="">Both directions</option>
+            <option value="send">Send</option>
+            <option value="receive">Receive</option>
+          </select>
+          <select id="filter-status" aria-label="Filter by decode status">
+            <option value="">Any status</option>
+            <option value="decoded">Decoded</option>
+            <option value="not-attempted">Not decoded</option>
+            <option value="payload-empty">Empty</option>
+            <option value="wire-error">Wire error</option>
+            <option value="schema-error">Schema error</option>
+            <option value="skipped-text">Text frame</option>
+          </select>
+          <span class="filters__count" id="message-count">0</span>
+        </div>
+
+        <div class="table-wrap" id="table-wrap">
+          <table class="messages-table">
+            <thead>
+              <tr>
+                <th scope="col" class="col-time">Time</th>
+                <th scope="col" class="col-dir">Dir</th>
+                <th scope="col" class="col-conn">Connection</th>
+                <th scope="col" class="col-size">Size</th>
+                <th scope="col" class="col-format">Format</th>
+                <th scope="col" class="col-status">Status</th>
+                <th scope="col" class="col-type">Type</th>
+              </tr>
+            </thead>
+            <tbody id="message-body"></tbody>
+          </table>
+          <p class="empty" id="messages-empty">
+            No messages match the current filters.
+          </p>
+        </div>
+      </section>
+
+      <section class="detail" aria-label="Message detail">
+        <div class="pane__header">
+          <h2>Detail</h2>
+          <div class="detail__actions">
+            <button type="button" id="btn-copy" class="btn btn--small" disabled>Copy</button>
+          </div>
+        </div>
+
+        <div class="detail__body" id="detail-body">
+          <p class="empty" id="detail-empty">Select a message to inspect it.</p>
+          <div id="detail-content" hidden>
+            <dl class="meta" id="detail-meta"></dl>
+            <div class="tabs" role="tablist" aria-label="Message views">
+              <button type="button" role="tab" class="tab is-active" data-tab="decoded" aria-selected="true">Decoded</button>
+              <button type="button" role="tab" class="tab" data-tab="wire" aria-selected="false">Wire</button>
+              <button type="button" role="tab" class="tab" data-tab="hex" aria-selected="false">Hex</button>
+              <button type="button" role="tab" class="tab" data-tab="text" aria-selected="false">Raw text</button>
+              <button type="button" role="tab" class="tab" data-tab="diagnostics" aria-selected="false">Diagnostics</button>
+            </div>
+            <div class="tab-panel" data-panel="decoded" role="tabpanel">
+              <div class="decode-controls">
+                <label class="field field--inline">
+                  <span class="field__label">Decode as</span>
+                  <select id="decode-type-select"><option value="">Select a message type</option></select>
+                </label>
+                <button type="button" id="btn-decode" class="btn btn--small btn--primary">Decode</button>
+              </div>
+              <pre class="code" id="decoded-output"></pre>
+            </div>
+            <div class="tab-panel" data-panel="wire" role="tabpanel" hidden>
+              <div class="decode-controls">
+                <label class="field field--inline field--checkbox">
+                  <input type="checkbox" id="wire-nested" checked />
+                  <span>Show nested message interpretation where it parses</span>
+                </label>
+              </div>
+              <div class="wire-tree" id="wire-output"></div>
+            </div>
+            <div class="tab-panel" data-panel="hex" role="tabpanel" hidden>
+              <pre class="code" id="hex-output"></pre>
+            </div>
+            <div class="tab-panel" data-panel="text" role="tabpanel" hidden>
+              <pre class="code" id="text-output"></pre>
+            </div>
+            <div class="tab-panel" data-panel="diagnostics" role="tabpanel" hidden>
+              <div class="diagnostics" id="diagnostics-output"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <dialog id="schema-dialog" class="dialog">
+      <form method="dialog" class="dialog__inner">
+        <h2>Protobuf schemas</h2>
+        <p class="muted">
+          Files are parsed locally and never evaluated or uploaded. Imports between uploaded
+          files resolve automatically; <code>google/protobuf/*.proto</code> well-known types
+          are built in.
+        </p>
+        <div class="dialog__row">
+          <input type="file" id="schema-files" accept=".proto" multiple />
+          <button type="button" id="btn-schema-add" class="btn btn--primary">Load files</button>
+        </div>
+        <ul class="file-list" id="schema-file-list"></ul>
+        <div class="schema-errors" id="schema-errors" hidden></div>
+        <div class="dialog__actions">
+          <button type="button" id="btn-schema-clear" class="btn">Remove all</button>
+          <button type="button" id="btn-schema-close" class="btn btn--primary">Done</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script src="panel.js"></script>
+  </body>
+</html>

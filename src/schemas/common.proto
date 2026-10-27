@@ -1,0 +1,27 @@
+syntax = "proto2";
+
+package common;
+
+// A proto2 file, to exercise required fields, defaults, packed repeated
+// scalars and proto2 group encoding.
+
+message Envelope {
+  required uint32 version = 1;
+  optional string origin = 2 [default = "unknown"];
+  repeated fixed32 checksums = 3 [packed = true];
+  optional Kind kind = 4 [default = PING];
+
+  enum Kind {
+    PING = 0;
+    DATA = 1;
+    BYE = 2;
+  }
+}
+
+message WithGroup {
+  optional group Meta = 1 {
+    optional int32 priority = 2;
+    optional string tag = 3;
+  }
+  optional string after = 4;
+}

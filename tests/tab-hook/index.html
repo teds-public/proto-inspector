@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Proto Inspector manual test page</title>
+    <style>
+      body { font: 13px system-ui, sans-serif; margin: 24px; }
+      button { font: inherit; padding: 6px 12px; margin-right: 6px; }
+      pre { background: #f4f4f4; padding: 12px; }
+    </style>
+  </head>
+  <body>
+    <h1>Proto Inspector manual test page</h1>
+    <p>
+      Serves as the target for the manual integration test. Start the sample server with
+      <code>npm run sample-server</code> and open this page from the URL it prints.
+    </p>
+    <button id="connect" type="button">Connect</button>
+    <button id="login" type="button">Send LoginRequest</button>
+    <button id="chat" type="button">Send ChatMessage</button>
+    <button id="malformed" type="button">Send malformed frames</button>
+    <pre id="log"></pre>
+    <script src="app.js"></script>
+  </body>
+</html>

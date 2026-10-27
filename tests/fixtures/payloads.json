@@ -1,0 +1,231 @@
+{
+  "generatedBy": "scripts/make-fixtures.mjs",
+  "cases": [
+    {
+      "kind": "schema",
+      "name": "login-request",
+      "messageType": "game.LoginRequest",
+      "hex": "0a09636f6d6d616e646572120768756e7465723218072002",
+      "size": 24,
+      "expected": {
+        "username": "commander",
+        "password": "hunter2",
+        "protocol_version": 7,
+        "preferred_class": 2
+      }
+    },
+    {
+      "kind": "schema",
+      "name": "login-response",
+      "messageType": "game.LoginResponse",
+      "hex": "08011a5708ffffffffffffffffff0112035a65641803220a0d0000c03f15000010c02a0c0aecffffffffffffffff011e3204000102ff3a0c0a08737472656e677468100c3a0b0a076167696c697479100740ffffffffffffffff7f2200220a0d000020411d0000a0402a0d73657373696f6e2d746f6b656e3a0908071205736576656e3a0a082a1206616e73776572",
+      "size": 143,
+      "expected": {
+        "ok": true,
+        "player": {
+          "id": "18446744073709551615",
+          "name": "Zed",
+          "class": 3,
+          "position": {
+            "x": 1.5,
+            "y": -2.25,
+            "z": 0
+          },
+          "scores": [
+            10,
+            -20,
+            30
+          ],
+          "avatar": {
+            "$bytes": "AAEC/w=="
+          },
+          "stats": {
+            "strength": 12,
+            "agility": 7
+          },
+          "high_score": "9223372036854775807"
+        },
+        "waypoints": [
+          {
+            "x": 0,
+            "y": 0,
+            "z": 0
+          },
+          {
+            "x": 10,
+            "y": 0,
+            "z": 5
+          }
+        ],
+        "token": "session-token",
+        "labels": {
+          "7": "seven",
+          "42": "answer"
+        }
+      }
+    },
+    {
+      "kind": "schema",
+      "name": "login-response-error",
+      "messageType": "game.LoginResponse",
+      "hex": "120f6261642063726564656e7469616c73301e",
+      "size": 19,
+      "expected": {
+        "ok": false,
+        "error_message": "bad credentials",
+        "retry_after_seconds": 30
+      }
+    },
+    {
+      "kind": "schema",
+      "name": "chat-empty",
+      "messageType": "game.ChatMessage",
+      "hex": "",
+      "size": 0,
+      "expected": {}
+    },
+    {
+      "kind": "schema",
+      "name": "chat-unicode",
+      "messageType": "game.ChatMessage",
+      "hex": "082a121268c3a96c6c6f20f09f8c8d2077c3b6726c6418ffffffffffffffffff012202406122024062",
+      "size": 41,
+      "expected": {
+        "sender_id": "42",
+        "text": "héllo 🌍 wörld",
+        "sent_at_millis": "-1",
+        "mentions": [
+          "@a",
+          "@b"
+        ]
+      }
+    },
+    {
+      "kind": "schema",
+      "name": "big-int64",
+      "messageType": "game.Player",
+      "hex": "0881808080808080104080808080808080808001",
+      "size": 20,
+      "expected": {
+        "id": "9007199254740993",
+        "high_score": "-9223372036854775808"
+      }
+    },
+    {
+      "kind": "schema",
+      "name": "proto2-envelope",
+      "messageType": "common.Envelope",
+      "hex": "08031204656467651a0801000000ffffffff2001",
+      "size": 20,
+      "expected": {
+        "version": 3,
+        "origin": "edge",
+        "checksums": [
+          1,
+          4294967295
+        ],
+        "kind": 1
+      }
+    },
+    {
+      "kind": "schema",
+      "name": "proto2-group",
+      "messageType": "common.WithGroup",
+      "hex": "0b10071a05616c7068610c22047461696c",
+      "size": 17,
+      "expected": {
+        "meta": {
+          "priority": 7,
+          "tag": "alpha"
+        },
+        "after": "tail"
+      }
+    },
+    {
+      "kind": "schema",
+      "name": "net-frame",
+      "messageType": "game.net.Frame",
+      "hex": "086312090880e2cfaa0610f4032a08080112026869187b",
+      "size": 23,
+      "expected": {
+        "sequence": 99,
+        "observed_at": {
+          "seconds": "1700000000",
+          "nanos": 500
+        },
+        "chat": {
+          "sender_id": "1",
+          "text": "hi",
+          "sent_at_millis": "123",
+          "mentions": []
+        }
+      }
+    },
+    {
+      "kind": "wire",
+      "name": "varints-and-lengths",
+      "hex": "0896011203616263",
+      "note": "field 1 varint 150, field 2 bytes 'abc'"
+    },
+    {
+      "kind": "wire",
+      "name": "fixed32-fixed64",
+      "hex": "0d0000c03f1100000000000000f03f",
+      "note": "field1 fixed32 1.5, field2 fixed64 1.0"
+    },
+    {
+      "kind": "wire",
+      "name": "nested",
+      "hex": "0a050801120161",
+      "note": "field1 length-delimited containing field1=1, field2='a'"
+    },
+    {
+      "kind": "wire",
+      "name": "truncated-varint",
+      "hex": "0880",
+      "note": "varint with continuation bit but no terminator"
+    },
+    {
+      "kind": "wire",
+      "name": "truncated-length",
+      "hex": "0a05abcd",
+      "note": "length says 5 bytes, only 2 present"
+    },
+    {
+      "kind": "wire",
+      "name": "field-number-zero",
+      "hex": "0001",
+      "note": "tag with field number 0"
+    },
+    {
+      "kind": "wire",
+      "name": "unsupported-wire-type",
+      "hex": "0e",
+      "note": "wire type 6"
+    },
+    {
+      "kind": "wire",
+      "name": "overlong-varint",
+      "hex": "08ffffffffffffffffffff01",
+      "note": "11-byte varint"
+    },
+    {
+      "kind": "wire",
+      "name": "big-varint",
+      "hex": "08ffffffffffffffffff01",
+      "note": "uint64 max"
+    },
+    {
+      "kind": "wire",
+      "name": "group",
+      "hex": "33380534",
+      "note": "proto2 group field 6 containing field 7 = 5"
+    },
+    {
+      "kind": "wire",
+      "name": "unterminated-group",
+      "hex": "333805",
+      "note": "group start without end tag"
+    }
+  ]
+}

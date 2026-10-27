@@ -1,0 +1,33 @@
+{
+  "name": "proto-inspector",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Chrome DevTools extension for real-time inspection and decoding of Protobuf WebSocket traffic.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "clean": "node scripts/clean.mjs",
+    "build": "node scripts/build.mjs",
+    "dev": "node scripts/build.mjs --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "package": "npm run build && node scripts/package.mjs",
+    "verify": "npm run typecheck && npm run test && npm run build",
+    "sample-server": "node scripts/sample-server.mjs",
+    "test:e2e": "npm run build && node tests/e2e/panel-smoke.mjs && node tests/e2e/devtools-panel.mjs"
+  },
+  "dependencies": {
+    "protobufjs": "8.8.1"
+  },
+  "devDependencies": {
+    "@types/chrome": "0.3.6",
+    "@types/node": "24.13.6",
+    "esbuild": "0.28.2",
+    "puppeteer-core": "25.16.0",
+    "typescript": "5.9.3",
+    "vitest": "5.0.5"
+  }
+}

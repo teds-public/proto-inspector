@@ -1,0 +1,56 @@
+syntax = "proto3";
+
+package game;
+
+// Sample schema used by the tests and the local sample server.
+// It exercises every feature the decoder must handle.
+
+enum PlayerClass {
+  PLAYER_CLASS_UNSPECIFIED = 0;
+  WARRIOR = 1;
+  ROGUE = 2;
+  MAGE = 3;
+}
+
+message Vector3 {
+  float x = 1;
+  float y = 2;
+  float z = 3;
+}
+
+message Player {
+  uint64 id = 1;
+  string name = 2;
+  PlayerClass class = 3;
+  Vector3 position = 4;
+  repeated int32 scores = 5;
+  bytes avatar = 6;
+  map<string, int32> stats = 7;
+  int64 high_score = 8;
+}
+
+message LoginRequest {
+  string username = 1;
+  string password = 2;
+  uint32 protocol_version = 3;
+  PlayerClass preferred_class = 4;
+}
+
+message LoginResponse {
+  bool ok = 1;
+  string error_message = 2;
+  Player player = 3;
+  repeated Vector3 waypoints = 4;
+  oneof session {
+    string token = 5;
+    uint32 retry_after_seconds = 6;
+  }
+  map<int32, string> labels = 7;
+}
+
+message ChatMessage {
+  uint64 sender_id = 1;
+  string text = 2;
+  int64 sent_at_millis = 3;
+  repeated string mentions = 4;
+}

@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "Proto Inspector",
+  "version": "0.1.0",
+  "description": "Inspect WebSocket traffic and decode Protobuf payloads locally in a DevTools panel.",
+  "minimum_chrome_version": "116",
+  "devtools_page": "devtools/devtools.html",
+  "background": {
+    "service_worker": "background/worker.js",
+    "type": "module"
+  },
+  "permissions": ["debugger", "storage", "tabs"],
+  "host_permissions": [],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
+  },
+  "icons": {
+    "16": "icons/icon-16.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  }
+}
