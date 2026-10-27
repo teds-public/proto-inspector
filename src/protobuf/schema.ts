@@ -85,14 +85,27 @@ const WELL_KNOWN = new Set([
   "google/protobuf/json_enumvalue_options.proto",
 ]);
 
-function addWellKnownTypes(root: protobuf.Root): void {
+/** Adds the bundled `google/protobuf/*` types and returns the names it added. */
+function addWellKnownTypes(root: protobuf.Root): Set<string> {
+  const added = new Set<string>();
   const bundled = protobuf.common as unknown as Record<string, unknown> | undefined;
-  if (!bundled) return;
+  if (!bundled) return added;
   for (const [name, json] of Object.entries(bundled)) {
     if (name === "get" || !WELL_KNOWN.has(name)) continue;
     const nested = (json as { nested?: unknown }).nested;
-    if (nested) root.addJSON(nested as Record<string, never>);
+    if (!nested) continue;
+    root.addJSON(nested as Record<string, never>);
   }
+  const collect = (ns: protobuf.NamespaceBase): void => {
+    for (const nested of ns.nestedArray) {
+      if (nested instanceof protobuf.Type || nested instanceof protobuf.Enum) {
+        added.add(nested.fullName.replace(/^\./, ""));
+      }
+      if (nested instanceof protobuf.Namespace) collect(nested);
+    }
+  };
+  collect(root);
+  return added;
 }
 
 interface ParsedFile {
@@ -130,7 +143,7 @@ export async function loadSchema(files: readonly ProtoFile[]): Promise<SchemaLoa
   }
 
   const root = new protobuf.Root();
-  addWellKnownTypes(root);
+  const wellKnownNames = addWellKnownTypes(root);
 
   const parsed: ParsedFile[] = [];
   for (const [name, file] of normalized) {
@@ -175,12 +188,24 @@ export async function loadSchema(files: readonly ProtoFile[]): Promise<SchemaLoa
     const start = scope && "nestedArray" in scope ? scope : root;
     walkTypes(start as protobuf.NamespaceBase, messageTypes, enumTypes, seen);
   }
-  // Include types contributed by imports even when no file declared them.
+  // Include types contributed by imports even when no file declared them, but
+  // drop the bundled well-known types: they are support code, not messages the
+  // user is inspecting, and they must not appear as detection candidates.
   walkTypes(root, messageTypes, enumTypes, seen);
 
-  messageTypes.sort();
-  enumTypes.sort();
-  return { ok: true, errors, warnings, messageTypes, enumTypes, files: [...normalized.keys()], root };
+  const userMessages = messageTypes.filter((name) => !wellKnownNames.has(name));
+  const userEnums = enumTypes.filter((name) => !wellKnownNames.has(name));
+  userMessages.sort();
+  userEnums.sort();
+  return {
+    ok: true,
+    errors,
+    warnings,
+    messageTypes: userMessages,
+    enumTypes: userEnums,
+    files: [...normalized.keys()],
+    root,
+  };
 }
 
 function walkTypes(
@@ -209,12 +234,29 @@ function walkTypes(
   }
 }
 
+/** How one declared field was used while decoding, relative to its frequency. */
+export interface FieldUsage {
+  /** Field occurrences seen in the payload. */
+  readonly occurrences: number;
+  /** Occurrences that carried a non-empty value (not `""`, `0`, `[]`, `{}`). */
+  readonly populated: number;
+}
+
+export interface DecodeStats {
+  /** Usage per declared field id. Fields absent from the map never appeared. */
+  readonly fields: ReadonlyMap<number, FieldUsage>;
+  /** Wire fields whose number is not declared in the schema. */
+  readonly unknownFields: number;
+}
+
 export interface DecodeResult {
   readonly messageType: string;
   readonly json: Record<string, JsonValue>;
   /** Number of bytes consumed by the top-level message. */
   readonly consumedBytes: number;
   readonly fieldCount: number;
+  /** Per-field usage, used to score how well a payload fits a message type. */
+  readonly stats: DecodeStats;
 }
 
 /**
@@ -235,7 +277,7 @@ export function decodeWithSchema(
   }
   const type = root.lookupType(messageTypeName);
   const json: Record<string, JsonValue> = Object.create(null) as Record<string, JsonValue>;
-  const state = { fieldCount: 0 };
+  const state: DecodeState = { fieldCount: 0, fields: new Map(), unknownFields: 0 };
   // readFields consumes the whole buffer or throws, so any leftover content
   // (including a zero tag) fails inside the loop.
   let consumed: number;
@@ -247,11 +289,50 @@ export function decodeWithSchema(
     if (error instanceof SchemaDecodeError) throw error;
     throw new SchemaDecodeError(error instanceof Error ? error.message : String(error));
   }
-  return { messageType: type.fullName.replace(/^\./, ""), json, consumedBytes: consumed, fieldCount: state.fieldCount };
+  return {
+    messageType: type.fullName.replace(/^\./, ""),
+    json,
+    consumedBytes: consumed,
+    fieldCount: state.fieldCount,
+    stats: { fields: state.fields, unknownFields: state.unknownFields },
+  };
 }
 
 interface DecodeState {
   fieldCount: number;
+  readonly fields: Map<number, FieldUsage>;
+  unknownFields: number;
+}
+
+function newState(): DecodeState {
+  return { fieldCount: 0, fields: new Map(), unknownFields: 0 };
+}
+
+function recordUsage(state: DecodeState, fieldNumber: number, populated: boolean): void {
+  const existing = state.fields.get(fieldNumber);
+  if (!existing) {
+    state.fields.set(fieldNumber, { occurrences: 1, populated: populated ? 1 : 0 });
+    return;
+  }
+  // FieldUsage is readonly for consumers; the internal map owns the counters.
+  const usage = existing as { occurrences: number; populated: number };
+  usage.occurrences++;
+  if (populated) usage.populated++;
+}
+
+/**
+ * True when a decoded value carries information: an empty string, zero, false,
+ * an empty list or an empty message is what a field that was merely present
+ * would look like, so it does not help identify the message type.
+ */
+function isPopulated(value: JsonValue): boolean {
+  if (value === null || value === undefined) return false;
+  if (typeof value === "string") return value.length > 0;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value === "boolean") return value;
+  if (Array.isArray(value)) return value.length > 0;
+  if (typeof value === "object") return Object.keys(value).length > 0;
+  return true;
 }
 
 /**
@@ -282,7 +363,10 @@ function readFields(
     }
     const field = type.fieldsById[fieldNumber];
     if (!field) {
-      // Unknown fields are skipped, matching normal protobuf semantics.
+      // Unknown fields are skipped, matching normal protobuf semantics, but they
+      // are counted: a payload whose fields mostly do not exist in the chosen
+      // type is probably a different message.
+      state.unknownFields++;
       reader.skipType(wireType);
       continue;
     }
@@ -314,7 +398,9 @@ function readField(
     const list = ensureArray(out, name);
     const packedReader = protobuf.Reader.create(packed);
     while (packedReader.pos < packed.length) {
-      list.push(readScalar(packedReader, field, packedWireType(field.type), limits, depth + 1));
+      const item = readScalar(packedReader, field, packedWireType(field.type), limits, depth + 1, state);
+      list.push(item);
+      recordUsage(state, field.id, isPopulated(item));
       state.fieldCount++;
       if (state.fieldCount > limits.maxFields) {
         throw new SchemaDecodeError(`Field count exceeds limit of ${limits.maxFields}`, reader.pos);
@@ -322,11 +408,13 @@ function readField(
     }
     return;
   }
-  const value = readScalar(reader, field, wireType, limits, depth + 1);
+  const value = readScalar(reader, field, wireType, limits, depth + 1, state);
   if (field.repeated) {
     ensureArray(out, name).push(value);
+    recordUsage(state, field.id, isPopulated(value));
   } else {
     out[name] = value;
+    recordUsage(state, field.id, isPopulated(value));
   }
 }
 
@@ -381,6 +469,7 @@ function readScalar(
   wireType: number,
   limits: DecodeLimits,
   depth: number,
+  state: DecodeState,
 ): JsonValue {
   const type = field.type;
   if (isGroupField(field)) {
@@ -389,7 +478,7 @@ function readScalar(
     }
     const nestedType = field.resolvedType as protobuf.Type;
     const nested: Record<string, JsonValue> = Object.create(null) as Record<string, JsonValue>;
-    readGroup(reader, nestedType, field.id, nested, limits, depth);
+    readGroup(reader, nestedType, field.id, nested, limits, depth, state);
     return nested;
   }
 
@@ -401,7 +490,7 @@ function readScalar(
     const end = reader.pos + length;
     if (end > reader.len) throw new SchemaDecodeError("Nested message exceeds payload", reader.pos);
     const nested: Record<string, JsonValue> = Object.create(null) as Record<string, JsonValue>;
-    readFields(reader.buf.subarray(reader.pos, end), field.resolvedType, nested, limits, depth, { fieldCount: 0 });
+    readFields(reader.buf.subarray(reader.pos, end), field.resolvedType, nested, limits, depth, newState());
     reader.pos = end;
     return nested;
   }
@@ -466,6 +555,7 @@ function readGroup(
   out: Record<string, JsonValue>,
   limits: DecodeLimits,
   depth: number,
+  state: DecodeState,
 ): void {
   if (depth > limits.maxDepth) throw new SchemaDecodeError(`Nesting deeper than ${limits.maxDepth} levels`, reader.pos);
   while (reader.pos < reader.len) {
@@ -484,7 +574,7 @@ function readGroup(
       reader.skipType(wireType);
       continue;
     }
-    readField(reader, field, wireType, out, limits, depth, { fieldCount: 0 });
+    readField(reader, field, wireType, out, limits, depth, state);
   }
   throw new SchemaDecodeError(`Unterminated group for field ${groupFieldNumber}`, reader.pos);
 }
@@ -521,11 +611,11 @@ function readMapEntry(
         const vend = sub.pos + vlen;
         if (vend > sub.len) throw new SchemaDecodeError("Map value message exceeds entry", sub.pos);
         const nested: Record<string, JsonValue> = Object.create(null) as Record<string, JsonValue>;
-        readFields(sub.buf.subarray(sub.pos, vend), field.resolvedType, nested, limits, depth + 1, { fieldCount: 0 });
+        readFields(sub.buf.subarray(sub.pos, vend), field.resolvedType, nested, limits, depth + 1, newState());
         sub.pos = vend;
         value = nested;
       } else {
-        value = readScalar(sub, field, innerWire, limits, depth + 1);
+        value = readScalar(sub, field, innerWire, limits, depth + 1, state);
       }
     } else {
       sub.skipType(innerWire);
@@ -533,6 +623,7 @@ function readMapEntry(
   }
   reader.pos = end;
   state.fieldCount++;
+  recordUsage(state, field.id, isPopulated(value));
 
   const isStringKey = keyTypeOf(field) === "string" || keyTypeOf(field) === "bool";
   if (isStringKey) {
@@ -590,4 +681,42 @@ function defaultScalar(type: string): JsonValue {
     default:
       return 0;
   }
+}
+
+/** True for the synthetic `XEntry` type protobufjs creates for a `map<>` field. */
+export function isMapEntryType(type: protobuf.Type): boolean {
+  const options = type.options as { mapEntry?: unknown } | undefined;
+  return options?.mapEntry === true || options?.mapEntry === "true";
+}
+
+/**
+ * Message types that can be a decoding root, in declaration order.
+ *
+ * Excludes the synthetic map-entry types protobufjs creates when a schema is
+ * loaded from JSON, and — by default — the bundled `google.protobuf.*` well-known
+ * types, which are support code rather than the user's own messages.
+ */
+export function listDecodableTypes(
+  root: protobuf.Root,
+  options: { readonly includeWellKnown?: boolean } = {},
+): protobuf.Type[] {
+  const out: protobuf.Type[] = [];
+  const seen = new Set<string>();
+  const walk = (ns: protobuf.NamespaceBase): void => {
+    for (const nested of ns.nestedArray) {
+      if (nested instanceof protobuf.Type) {
+        const name = nested.fullName.replace(/^\./, "");
+        const bundled = !options.includeWellKnown && name.startsWith("google.protobuf.");
+        if (!bundled && !isMapEntryType(nested) && !seen.has(nested.fullName)) {
+          seen.add(nested.fullName);
+          out.push(nested);
+        }
+        walk(nested);
+      } else if (nested instanceof protobuf.Namespace) {
+        walk(nested);
+      }
+    }
+  };
+  walk(root);
+  return out;
 }

@@ -262,8 +262,49 @@ async function main() {
     check(filteredCount === 0, `search filter excludes non-matching rows (${filteredCount} left)`);
     await panel.$eval("#filter-search", (el) => { el.value = ""; el.dispatchEvent(new Event("input", { bubbles: true })); });
 
+    // The panel is split into two views; switching must not disturb capture.
+    await panel.click("#tab-settings");
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const settingsView = await panel.evaluate(() => {
+      const start = document.getElementById("btn-start");
+      return {
+        captureHidden: document.getElementById("view-capture").hidden,
+        settingsHidden: document.getElementById("view-settings").hidden,
+        active: document.querySelector(".view-tab.is-active")?.id,
+        // The capture buttons now live inside the capture view.
+        startInCapture: start.closest("#view-capture") !== null,
+        startVisible: start.getBoundingClientRect().height > 0,
+        defaultTypeGone: document.getElementById("input-default-type") === null,
+      };
+    });
+    check(
+      settingsView.settingsHidden === false && settingsView.captureHidden === true,
+      "Settings tab shows the settings view",
+    );
+    check(settingsView.active === "tab-settings", "Settings tab is marked active");
+    check(settingsView.startInCapture, "capture buttons live inside the capture view");
+    check(settingsView.startVisible === false, "capture buttons are not visible in Settings");
+    check(settingsView.defaultTypeGone, "the default message type field is gone");
+    check(
+      await panel.evaluate(() => document.getElementById("attach-warning") === null),
+      "the debugger attach notice is gone",
+    );
+    check(
+      await panel.evaluate(() => document.getElementById("input-retention").value === "500"),
+      "retention limit defaults to 500",
+    );
+    await panel.click("#tab-capture");
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    check(
+      await panel.evaluate(() => {
+        const start = document.getElementById("btn-start");
+        return !document.getElementById("view-capture").hidden && start.getBoundingClientRect().height > 0;
+      }),
+      "Capture tab restores the capture view and its buttons",
+    );
+
     // Settings round trip: retention limit is validated and persisted.
-    await panel.click("#btn-settings");
+    await panel.click("#tab-settings");
     await panel.$eval("#input-retention", (el) => { el.value = "250"; });
     await panel.click("#btn-save-settings");
     const storedRetention = await waitFor(
@@ -276,7 +317,7 @@ async function main() {
       "saved retention",
     );
     check(storedRetention === 250, `retention setting persisted (${storedRetention})`);
-    await panel.click("#btn-settings");
+    await panel.click("#tab-capture");
 
     // Malformed frames must still be captured and reported without crashing.
     await page.evaluate(() => window.sendMalformed());
@@ -327,6 +368,67 @@ async function main() {
       return ran;
     });
     check(inlineRan === false, "extension page CSP blocks inline script injection");
+
+    // Choosing a schema decodes the frame; nothing is guessed automatically.
+    await page.evaluate(() => window.sendLogin());
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    const untypedRow = await waitFor(
+      async () => {
+        const rows = await panel.$$eval("#message-body tr", (list) =>
+          list.map((row) => ({
+            frameId: row.dataset.frameId ?? "",
+            status: row.children[5]?.textContent ?? "",
+            type: row.children[6]?.textContent ?? "",
+            typeClass: row.children[6]?.className ?? "",
+          })),
+        );
+        // A frame nobody has decoded: no type, wire-format only.
+        return rows.find((row) => row.type === "" || row.type === "—")?.frameId ?? "";
+      },
+      15_000,
+      "an undecoded row",
+    );
+    await panel.evaluate((frameId) => {
+      const row = document.querySelector(`tr[data-frame-id="${frameId}"]`);
+      if (row) row.click();
+    }, untypedRow);
+    await panel.waitForFunction(() => document.querySelector("#detail-content")?.hidden === false);
+    const noGuess = await panel.$eval("#decoded-output", (el) => el.textContent ?? "");
+    check(
+      /No message type selected/.test(noGuess) || /not valid protobuf/i.test(noGuess),
+      "an unchosen frame is not guessed at",
+    );
+
+    // Reusing the picked schema across the same wire shape.
+    await panel.evaluate(() => {
+      const rows = [...document.querySelectorAll("#message-body tr")];
+      const target = rows.find(
+        (row) => row.querySelector(".dir")?.textContent === "SEND" && row.children[6]?.textContent === "game.LoginRequest",
+      );
+      if (!target) throw new Error("no LoginRequest row to pick from");
+      target.click();
+    });
+    await panel.waitForFunction(() => (document.querySelector("#type-source")?.textContent ?? "").length > 0);
+    await panel.select("#decode-type-select", "game.ChatMessage");
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    const remembered = await panel.$$eval("#message-body tr", (rows) =>
+      rows.filter((row) => row.children[6]?.className === "type--remembered").length,
+    );
+    check(remembered > 0, `a picked schema is reused for the same shape (${remembered} rows)`);
+
+    // Turning the option off stops the reuse.
+    await panel.click("#tab-settings");
+    await panel.click("#input-reuse-schema");
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    await panel.click("#tab-capture");
+    const afterOff = await panel.$$eval("#message-body tr", (rows) =>
+      rows.filter((row) => row.children[6]?.className === "type--remembered").length,
+    );
+    check(afterOff === 0, "disabling the option stops schema reuse");
+    await panel.click("#tab-settings");
+    await panel.click("#input-reuse-schema");
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await panel.click("#tab-capture");
 
     // Pause must stop capture; resume must restart it.
     const beforePause = await panel.$$eval("#message-body tr", (rows) => rows.length);

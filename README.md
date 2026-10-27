@@ -57,9 +57,9 @@ Reloading the extension detaches the debugger, so click **Start capture** again.
 
 ### Screenshots
 
-| Decoded | Wire format | Hex |
-| --- | --- | --- |
-| ![Decoded JSON view](docs/screenshot-decoded.png) | ![Schema-free wire view](docs/screenshot-wire.png) | ![Hex dump view](docs/screenshot-hex.png) |
+| Capture tab | Settings tab |
+| --- | --- |
+| ![Capture tab](docs/screenshot-capture-tab.png) | ![Settings tab](docs/screenshot-settings-tab.png) |
 
 ---
 
@@ -122,6 +122,15 @@ and `message` events without modifying payloads, and register it as `page-hook` 
 
 ## The panel
 
+The panel has two tabs. **Capture** is the working view; **Settings** holds configuration.
+Switching tabs never pauses capture — the debugger attachment is untouched, so frames keep
+arriving while you edit settings.
+
+### Capture tab
+
+The capture controls (**Start capture**, **Stop**, **Pause**, **Clear**, **Export JSON**) sit
+at the top of this tab, next to the data they act on.
+
 - **Connections**: URL, state (`connecting` / `open` / `closed` / `error`), discovery time,
   and send/receive counts. Select one to filter.
 - **Messages**: time, direction (`SEND` / `RECV`), connection, size, frame format, decode
@@ -136,6 +145,14 @@ and `message` events without modifying payloads, and register it as `page-hook` 
 
 Rendering is capped at the newest 500 rows; the counter always states how many are shown and
 how many were evicted, so nothing is silently dropped.
+
+### Settings tab
+
+- **Retention limit** — how many messages to keep, **500** by default.
+- **Decode automatically with the loaded schema**
+- **Use the same picked schema for messages with the same shape**
+
+Changes apply immediately; there is nothing to save.
 
 ---
 
@@ -181,18 +198,37 @@ of the message, unterminated or mismatched groups, oversized messages, excessive
 and excessive nesting. Schema-free inspection **cannot** infer field names, application types,
 or whether a length-delimited field is a nested message; the UI says so.
 
-### Application envelopes (optional)
+### Choosing a schema
 
-Some protocols prefix a header and a message id. The **Settings → Application envelope** panel
-configures this *without* touching the decoder:
+Nothing is guessed. A frame is decoded when a schema is chosen for it; until then it stays at
+wire-format level (`RAW` in the table, with the field view still available).
 
-- header length and payload offset (bytes),
-- optional message id at an offset, encoded as `uint8`, `uint16le/be`, `uint32le/be`, or
-  `varint`,
-- a mapping from message id to message type.
+Pick a type in **Decode as** and the frame decodes immediately. Two options control what
+happens next:
 
-Only the remaining bytes are handed to the protobuf decoder. This is configuration, not
-reverse engineering: it cannot decode encrypted or compressed traffic.
+- **Decode automatically with the loaded schema** — apply the chosen schema as soon as a frame
+  arrives instead of waiting for the Decode button.
+- **Use the same picked schema for messages with the same shape** — when you pick a type, every
+  other captured message with the same wire shape (same field numbers and wire types at every
+  level) is decoded with it too. Those rows are marked `reused for this message shape`.
+
+The second option is what makes a session usable: pick once for a request type and its replies
+decode as they arrive. Turn it off and each message needs its own choice.
+
+Because the choice is yours, it is never overridden: the type shown is always the one you
+picked for that frame or for its shape.
+
+### Schema-free wire format
+
+`src/protobuf/wire.ts` is an independent parser (no protobufjs) that reports field numbers,
+wire types, varints (with signed and zigzag interpretations), fixed32/fixed64, groups, and
+length-delimited payloads with their byte length and optional nested interpretation.
+
+It rejects, with the byte offset of the failure: truncated varints, varints longer than 10
+bytes, field number 0, field numbers above 2^29−1, unsupported wire types, lengths past the end
+of the message, unterminated or mismatched groups, oversized messages, excessive field counts,
+and excessive nesting. Schema-free inspection **cannot** infer field names, application types,
+or whether a length-delimited field is a nested message; the UI says so.
 
 ---
 
@@ -212,8 +248,11 @@ Permissions declared: `debugger`, `storage`, `tabs`. No host permissions.
 | Payload execution | Never. Captured data is rendered as text nodes, never as HTML. |
 | Cleanup | State is cleared on **Clear**, on page navigation, and on tab close. |
 
-`chrome.debugger` shows Chrome's "started debugging this browser" notification while attached,
-and can conflict with other tools that attach to the same tab. Both are surfaced in the UI.
+`chrome.debugger` shows Chrome's "started debugging this browser" notification while attached;
+that is expected. DevTools itself can stay open on the same tab — this was verified against
+Chrome for Testing, and Chromium supports multiple protocol clients per target. Capture is
+blocked when *another* extension or tool already holds a debugger on the same tab, and the
+panel reports that error rather than attaching anyway.
 
 Exported files contain raw application data. Treat them as sensitive.
 
@@ -227,10 +266,15 @@ value falls back to defaults instead of breaking the panel.
 
 | Setting | Default | Range |
 | --- | --- | --- |
-| Retention limit | 5000 messages | 100 – 50000 |
+| Retention limit | 500 messages | 100 – 50000 |
 | Nested wire depth | 16 | 1 – 64 |
 | Automatic decoding | on | — |
-| Default message type | none | any loaded type |
+| Reuse picked schema | on | — |
+| Filter possible schema | off | — |
+
+The type chosen for a message is remembered for its wire shape for the lifetime
+of the panel. Nothing about captured traffic is persisted, so this resets when
+DevTools closes.
 
 ---
 
@@ -248,11 +292,10 @@ src/
   protobuf/
     wire.ts               Schema-free wire-format parser with limits
     schema.ts             .proto loading + CSP-safe reflection decoder
-    envelope.ts           Optional fixed header / message id handling
     json-value.ts         Lossless int64 / bytes / enum JSON projection
   panel/
     panel.ts              DOM controller (no innerHTML anywhere)
-    decode-service.ts     envelope → schema → wire pipeline (DOM-free, testable)
+    decode-service.ts     schema → wire pipeline (DOM-free, testable)
     format.ts             Presentation + export document builder
   storage/                Settings and schema persistence with validation
   schemas/                Sample .proto files
@@ -276,7 +319,7 @@ DOM-free modules so it can be tested directly.
 
 ```bash
 npm run typecheck   # tsc --noEmit (strict, noUncheckedIndexedAccess, exactOptionalPropertyTypes)
-npm test            # 139 unit tests
+npm test            # 159 unit tests
 npm run test:e2e    # real Chrome: needs Chrome for Testing (see below)
 npm run build
 ```
@@ -298,11 +341,11 @@ npx @puppeteer/browsers install chrome@stable --path "$TMPDIR/cft"
 | Check | Result |
 | --- | --- |
 | `tsc --noEmit` | passes |
-| Unit tests | **139 passed**, 5 files |
+| Unit tests | **159 passed**, 5 files |
 | `npm run build` | produces `dist/extension`; manifest references verified |
 | `npm run package` | ZIP integrity verified, 13 files |
 | `npm audit` | 0 vulnerabilities |
-| e2e `panel-smoke` | **24/24 checks passed** — capture, send/receive counts, schema decode, enum rendering, wire view, hex view, text frames, search filter, settings persistence, malformed frames, CSP enforcement, pause/resume, JSON export, clear, stop |
+| e2e `panel-smoke` | **35/35 checks passed** — capture, send/receive counts, schema decode, enum rendering, wire view, hex view, text frames, search filter, settings persistence, malformed frames, CSP enforcement, no-guess behaviour, schema reuse by shape, tab switching, pause/resume, JSON export, clear, stop |
 | e2e `devtools-panel` | **passed** — 2 frames captured with a real DevTools window open on the same tab |
 
 The e2e run also asserts that the extension page's CSP really blocks inline scripts while
@@ -316,11 +359,11 @@ instead of using protobufjs's `Function()`-based one.
 | Symptom | Cause and fix |
 | --- | --- |
 | Panel says "Could not determine the inspected tab" | Close and reopen the Proto Inspector panel. |
-| "Another debugger is already attached" | Another tool (or another DevTools session) owns the tab. Close it and press **Start capture**. |
+| "Another debugger is already attached" | Another extension or tool holds a debugger on this tab, or capture is already running here. Press **Stop**, detach the other tool, then **Start capture**. Plain DevTools does not cause this. |
 | "This tab cannot be inspected" | `chrome://`, `devtools://` and Web Store pages cannot be attached to. |
 | No connections appear | Capture must be started **before** the page opens the WebSocket. Start capture, then reload the page. |
 | Connection exists but no messages | The socket is idle, or it lives in a Worker (see limitations). |
-| "This payload is not valid protobuf" | The frame is text, Base64-wrapped, encrypted, or a different protocol. Check the Hex tab and the envelope settings. |
+| "This payload is not valid protobuf" | The frame is text, Base64-wrapped, encrypted, or a different protocol. Check the Hex tab, or pick a schema in **Decode as**. |
 | Decode error naming a field | The selected message type does not match the payload; try another type. |
 | Panel is empty after reloading the extension | Open DevTools again; the old panel's port no longer exists. |
 

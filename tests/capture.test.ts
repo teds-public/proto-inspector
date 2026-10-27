@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { decodeCdpFramePayload, frameKindLabel } from "../src/capture/cdp-frames";
-import { CaptureStore, clampRetention, MAX_RETENTION, MIN_RETENTION } from "../src/capture/store";
+import { CaptureStore, clampRetention, DEFAULT_RETENTION, MAX_RETENTION, MIN_RETENTION } from "../src/capture/store";
 import {
   parseFrameErrorEvent,
   parseFrameEvent,
@@ -208,7 +208,7 @@ describe("capture store", () => {
   it("clamps retention into the supported range", () => {
     expect(clampRetention(1)).toBe(MIN_RETENTION);
     expect(clampRetention(Number.MAX_SAFE_INTEGER)).toBe(MAX_RETENTION);
-    expect(clampRetention(Number.NaN)).toBe(5000);
+    expect(clampRetention(Number.NaN)).toBe(DEFAULT_RETENTION);
   });
 
   it("returns only the newest frames from listRecentFrames", () => {

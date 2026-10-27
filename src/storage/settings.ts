@@ -6,22 +6,23 @@
  */
 
 import { clampRetention, DEFAULT_RETENTION } from "../capture/store";
-import { parseEnvelopeConfig, type EnvelopeConfig } from "../protobuf/envelope";
 
 export interface Settings {
   readonly retentionLimit: number;
-  readonly envelope: EnvelopeConfig;
+  /** Decode each frame on arrival using the schema chosen for it. */
   readonly autoDecode: boolean;
-  /** Message type used when a frame carries no usable envelope id. */
-  readonly defaultMessageType: string | null;
+  /**
+   * Reuse the schema picked for one message for every later message with the
+   * same wire shape. A decision the user made, never a guess.
+   */
+  readonly reusePickedSchema: boolean;
   readonly maxNestedDepth: number;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
   retentionLimit: DEFAULT_RETENTION,
-  envelope: parseEnvelopeConfig(null),
   autoDecode: true,
-  defaultMessageType: null,
+  reusePickedSchema: true,
   maxNestedDepth: 16,
 };
 
@@ -36,15 +37,10 @@ export function validateSettings(raw: unknown): Settings {
     typeof record.maxNestedDepth === "number" && Number.isInteger(record.maxNestedDepth)
       ? Math.min(64, Math.max(1, record.maxNestedDepth))
       : DEFAULT_SETTINGS.maxNestedDepth;
-  const defaultMessageType =
-    typeof record.defaultMessageType === "string" && record.defaultMessageType.trim().length > 0
-      ? record.defaultMessageType.trim()
-      : null;
   return {
     retentionLimit: retention,
-    envelope: parseEnvelopeConfig(record.envelope),
     autoDecode: record.autoDecode !== false,
-    defaultMessageType,
+    reusePickedSchema: record.reusePickedSchema !== false,
     maxNestedDepth: depth,
   };
 }

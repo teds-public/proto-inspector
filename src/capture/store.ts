@@ -9,7 +9,7 @@
 import type { CapturedFrame, ConnectionInfo, FrameMetadata } from "../shared/model";
 import type { ConnectionRecord } from "../shared/protocol";
 
-export const DEFAULT_RETENTION = 5000;
+export const DEFAULT_RETENTION = 500;
 export const MIN_RETENTION = 100;
 export const MAX_RETENTION = 50_000;
 

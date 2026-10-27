@@ -13,89 +13,24 @@
         <strong>Proto Inspector</strong>
         <span class="toolbar__status" id="status-text">Idle</span>
       </div>
-      <div class="toolbar__actions">
-        <button type="button" id="btn-start" class="btn btn--primary">Start capture</button>
-        <button type="button" id="btn-stop" class="btn" disabled>Stop</button>
-        <button type="button" id="btn-pause" class="btn" disabled>Pause</button>
-        <button type="button" id="btn-clear" class="btn">Clear</button>
-        <button type="button" id="btn-export" class="btn">Export JSON</button>
-        <button type="button" id="btn-settings" class="btn" aria-expanded="false">Settings</button>
-      </div>
     </header>
 
-    <div class="notice notice--warning" id="attach-warning" hidden>
-      Attaching the debugger shows Chrome's "debugging this browser" notification and can
-      conflict with other debugging tools on the same tab. Capture only runs on the tab you
-      selected in DevTools.
+    <nav class="view-tabs" role="tablist" aria-label="Panel views">
+      <button type="button" role="tab" class="view-tab is-active" id="tab-capture"
+              data-view="capture" aria-selected="true" aria-controls="view-capture">Capture</button>
+      <button type="button" role="tab" class="view-tab" id="tab-settings"
+              data-view="settings" aria-selected="false" aria-controls="view-settings">Settings</button>
+    </nav>
+
+    <section class="view" id="view-capture" role="tabpanel" aria-labelledby="tab-capture">
+    <div class="capture-toolbar">
+      <button type="button" id="btn-start" class="btn btn--primary">Start capture</button>
+      <button type="button" id="btn-stop" class="btn" disabled>Stop</button>
+      <button type="button" id="btn-pause" class="btn" disabled>Pause</button>
+      <button type="button" id="btn-clear" class="btn">Clear</button>
+      <button type="button" id="btn-export" class="btn">Export JSON</button>
     </div>
     <div class="notice notice--error" id="error-banner" role="alert" hidden></div>
-
-    <section class="settings" id="settings-panel" hidden>
-      <div class="settings__grid">
-        <label class="field">
-          <span class="field__label">Retention limit (messages)</span>
-          <input type="number" id="input-retention" min="100" max="50000" step="100" value="5000" />
-          <span class="field__hint">Oldest messages are dropped first.</span>
-        </label>
-        <label class="field">
-          <span class="field__label">Default message type</span>
-          <input type="text" id="input-default-type" placeholder="package.Message" />
-          <span class="field__hint">Used for frames the envelope does not identify.</span>
-        </label>
-        <label class="field field--checkbox">
-          <input type="checkbox" id="input-auto-decode" checked />
-          <span>Decode automatically with the loaded schema</span>
-        </label>
-      </div>
-
-      <details class="envelope">
-        <summary>Application envelope (optional)</summary>
-        <p class="muted">
-          Use this when the frame is not a bare protobuf message, e.g. a fixed header followed
-          by a message id. The payload that remains must be a plain protobuf message.
-        </p>
-        <div class="settings__grid">
-          <label class="field field--checkbox">
-            <input type="checkbox" id="input-envelope-enabled" />
-            <span>Messages have a fixed envelope</span>
-          </label>
-          <label class="field">
-            <span class="field__label">Header length (bytes)</span>
-            <input type="number" id="input-header-length" min="0" max="64" value="0" />
-          </label>
-          <label class="field">
-            <span class="field__label">Message id encoding</span>
-            <select id="input-id-encoding">
-              <option value="">No message id</option>
-              <option value="uint8">uint8</option>
-              <option value="uint16le">uint16 little-endian</option>
-              <option value="uint16be">uint16 big-endian</option>
-              <option value="uint32le">uint32 little-endian</option>
-              <option value="uint32be">uint32 big-endian</option>
-              <option value="varint">varint</option>
-            </select>
-          </label>
-          <label class="field">
-            <span class="field__label">Message id offset</span>
-            <input type="number" id="input-id-offset" min="0" max="64" value="0" />
-          </label>
-          <label class="field">
-            <span class="field__label">Payload offset (bytes)</span>
-            <input type="number" id="input-payload-offset" min="0" max="64" value="0" />
-          </label>
-        </div>
-        <div class="field">
-          <span class="field__label">Message id → type mapping</span>
-          <textarea id="input-id-mapping" rows="4" spellcheck="false" placeholder="1=game.LoginRequest&#10;2=game.LoginResponse"></textarea>
-          <span class="field__hint">One <code>id=package.Message</code> per line.</span>
-        </div>
-      </details>
-
-      <div class="settings__actions">
-        <button type="button" id="btn-save-settings" class="btn btn--primary">Save settings</button>
-        <span class="muted" id="settings-saved"></span>
-      </div>
-    </section>
 
     <main class="layout">
       <aside class="connections" aria-label="WebSocket connections">
@@ -181,6 +116,7 @@
                 </label>
                 <button type="button" id="btn-decode" class="btn btn--small btn--primary">Decode</button>
               </div>
+              <p class="type-source" id="type-source" hidden></p>
               <pre class="code" id="decoded-output"></pre>
             </div>
             <div class="tab-panel" data-panel="wire" role="tabpanel" hidden>
@@ -205,6 +141,35 @@
         </div>
       </section>
     </main>
+    </section>
+
+    <section class="view" id="view-settings" role="tabpanel" aria-labelledby="tab-settings" hidden>
+    <div class="settings" id="settings-panel">
+      <div class="settings__block">
+        <label class="field field--narrow">
+          <span class="field__label">Retention limit (messages)</span>
+          <input type="number" id="input-retention" min="100" max="50000" step="100" value="500" />
+          <span class="field__hint">Oldest messages are dropped first.</span>
+        </label>
+        <div class="settings__checks">
+          <label class="field field--checkbox">
+            <input type="checkbox" id="input-auto-decode" checked />
+            <span>Decode automatically with the loaded schema</span>
+          </label>
+        </div>
+      </div>
+
+      <label class="field field--checkbox">
+        <input type="checkbox" id="input-reuse-schema" checked />
+        <span>Use the same picked schema for messages with the same shape</span>
+      </label>
+
+      <div class="settings__actions">
+        <button type="button" id="btn-save-settings" class="btn btn--primary">Save settings</button>
+        <span class="muted" id="settings-saved"></span>
+      </div>
+    </div>
+    </section>
 
     <dialog id="schema-dialog" class="dialog">
       <form method="dialog" class="dialog__inner">

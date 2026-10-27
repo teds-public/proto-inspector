@@ -75,7 +75,7 @@ export type WorkerResponse =
 export type WorkerEvent =
   | { readonly type: "connection-added"; readonly record: ConnectionRecord }
   | { readonly type: "connection-updated"; readonly record: ConnectionRecord }
-  | { readonly type: "frame-added"; readonly frame: FrameMetadata }
+  | { readonly type: "frame-added"; readonly frame: FrameMetadata; readonly payload: FramePayloadResponse }
   | { readonly type: "frames-cleared" }
   | { readonly type: "status-changed"; readonly status: CaptureStatus }
   | { readonly type: "capture-reset" };

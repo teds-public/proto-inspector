@@ -21,8 +21,7 @@ import {
   type WorkerEvent,
   type WorkerResponse,
 } from "../shared/protocol";
-import { decodeFrame, messageTypeOptions, type DecodeOutcome } from "./decode-service";
-import { parseEnvelopeConfig, type EnvelopeConfig } from "../protobuf/envelope";
+import { decodeFrame, messageTypeOptions, wireShape, type DecodeOutcome } from "./decode-service";
 import { loadSchema, type ProtoFile, type SchemaLoadResult } from "../protobuf/schema";
 import { loadSchemaSet, saveSchemaSet, sanitizeProtoFiles } from "../storage/schema-store";
 import { loadSettings, saveSettings, type Settings } from "../storage/settings";
@@ -69,10 +68,21 @@ interface PanelState {
   showNested: boolean;
   /** Message type explicitly chosen per frame, overriding the default. */
   chosenTypes: Map<string, string>;
+  /**
+   * Message type chosen per wire shape. A decision made for one message is
+   * reused for every later message with the same structure.
+   */
+  typeByShape: Map<string, string>;
   /** Frames the user asked to decode while automatic decoding is off. */
   forcedDecodes: Set<string>;
-  /** Most recent explicit type choice, reused for the next frames. */
-  lastChosenType: string | null;
+  /**
+   * Decode outcome per frame, keyed by a fingerprint of what determined it.
+   * Lets the table show the resolved type without re-running detection on
+   * every render.
+   */
+  outcomes: Map<string, { readonly key: string; readonly outcome: DecodeOutcome }>;
+  /** Wire shape per frame, cached because it is recomputed for every row. */
+  shapes: Map<string, string | null>;
   renderedRowCount: number;
 }
 
@@ -86,10 +96,9 @@ const state: PanelState = {
   selectedFrameId: null,
   payloads: new Map(),
   settings: {
-    retentionLimit: 5000,
-    envelope: parseEnvelopeConfig(null),
+    retentionLimit: 500,
     autoDecode: true,
-    defaultMessageType: null,
+    reusePickedSchema: true,
     maxNestedDepth: 16,
   },
   schema: null,
@@ -98,8 +107,10 @@ const state: PanelState = {
   activeTab: "decoded",
   showNested: true,
   chosenTypes: new Map(),
+  typeByShape: new Map(),
   forcedDecodes: new Set(),
-  lastChosenType: null,
+  outcomes: new Map(),
+  shapes: new Map(),
   renderedRowCount: 0,
 };
 
@@ -195,6 +206,7 @@ function handleWorkerMessage(message: WorkerResponse | WorkerEvent): void {
     }
     case "frame-added": {
       state.frames.push(message.frame);
+      state.payloads.set(message.payload.id, message.payload);
       trimLocalFrames();
       if (passesFilters(message.frame)) appendRow(message.frame);
       updateMessageCount();
@@ -206,6 +218,8 @@ function handleWorkerMessage(message: WorkerResponse | WorkerEvent): void {
       state.payloads.clear();
       state.chosenTypes.clear();
       state.forcedDecodes.clear();
+      state.outcomes.clear();
+      state.shapes.clear();
       state.selectedFrameId = null;
       renderMessages();
       renderDetail();
@@ -231,6 +245,8 @@ function handleWorkerMessage(message: WorkerResponse | WorkerEvent): void {
     }
     case "frame-payload": {
       state.payloads.set(message.id, message);
+      // The row could not name a type before its payload arrived.
+      refreshRow(message.id);
       if (state.selectedFrameId === message.id) renderDetail();
       return;
     }
@@ -275,7 +291,36 @@ function trimLocalFrames(): void {
       state.payloads.delete(frame.id);
       state.chosenTypes.delete(frame.id);
       state.forcedDecodes.delete(frame.id);
+      state.outcomes.delete(frame.id);
+      state.shapes.delete(frame.id);
     }
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Views                                                               */
+/* ------------------------------------------------------------------ */
+
+type PanelView = "capture" | "settings";
+
+/**
+ * Switches the top-level view.
+ *
+ * Capture keeps running while Settings is open: this is a view switch, not a
+ * pause, so nothing about the debugger attachment changes.
+ */
+function showView(view: PanelView): void {
+  for (const tab of document.querySelectorAll<HTMLButtonElement>(".view-tab")) {
+    const active = tab.dataset.view === view;
+    tab.classList.toggle("is-active", active);
+    tab.setAttribute("aria-selected", active ? "true" : "false");
+  }
+  el<HTMLElement>("view-capture").hidden = view !== "capture";
+  el<HTMLElement>("view-settings").hidden = view !== "settings";
+  if (view === "settings") {
+    // The attach notice and capture errors describe the capture view; leaving
+    // them above the settings form would be noise. They reappear on return.
+    renderStatus();
   }
 }
 
@@ -290,7 +335,6 @@ function renderStatus(): void {
   const startBtn = el<HTMLButtonElement>("btn-start");
   const stopBtn = el<HTMLButtonElement>("btn-stop");
   const pauseBtn = el<HTMLButtonElement>("btn-pause");
-  const warning = el<HTMLDivElement>("attach-warning");
   const banner = el<HTMLDivElement>("error-banner");
 
   if (!status) {
@@ -299,7 +343,6 @@ function renderStatus(): void {
     startBtn.disabled = true;
     stopBtn.disabled = true;
     pauseBtn.disabled = true;
-    warning.hidden = true;
     banner.hidden = true;
     return;
   }
@@ -326,7 +369,6 @@ function renderStatus(): void {
   stopBtn.disabled = !status.attached;
   pauseBtn.disabled = !status.attached;
   pauseBtn.textContent = status.paused ? "Resume" : "Pause";
-  warning.hidden = status.attached;
 }
 
 function showError(message: string): void {
@@ -413,7 +455,9 @@ function renderFilterOptions(): void {
 function passesFilters(frame: FrameMetadata): boolean {
   if (state.filters.connectionId && frame.connectionId !== state.filters.connectionId) return false;
   if (state.filters.direction && frame.direction !== state.filters.direction) return false;
-  if (state.filters.status && frame.decodeStatus !== state.filters.status) return false;
+  if (state.filters.status && frame.decodeStatus !== state.filters.status) {
+    return false;
+  }
   const search = state.filters.search.trim().toLowerCase();
   if (!search) return true;
   const haystack = [
@@ -499,6 +543,23 @@ function suspendStreaming(): void {
   streamingSuspended = true;
 }
 
+/**
+ * Decode result for a row, using only already-loaded payloads. Rows never
+ * trigger payload fetches of their own; the selected row and the export path
+ * do that.
+ */
+function resolvedDecode(frame: FrameMetadata): DecodeOutcome | null {
+  const payload = state.payloads.get(frame.id);
+  if (!payload) return null;
+  let bytes: Uint8Array;
+  try {
+    bytes = base64ToBytes(payload.base64);
+  } catch {
+    return null;
+  }
+  return cachedDecode(frame, bytes);
+}
+
 function buildRow(frame: FrameMetadata): HTMLTableRowElement {
   const row = document.createElement("tr");
   row.dataset.frameId = frame.id;
@@ -530,8 +591,9 @@ function buildRow(frame: FrameMetadata): HTMLTableRowElement {
   formatCell.className = "col-format";
   formatCell.textContent = frame.kind;
 
+  const resolved = resolvedDecode(frame);
   const status = document.createElement("td");
-  const badge = statusBadge(frame.decodeStatus);
+  const badge = statusBadge(resolved?.status ?? frame.decodeStatus);
   const badgeEl = document.createElement("span");
   badgeEl.className = "badge";
   badgeEl.dataset.tone = badge.tone;
@@ -539,8 +601,19 @@ function buildRow(frame: FrameMetadata): HTMLTableRowElement {
   status.append(badgeEl);
 
   const type = document.createElement("td");
-  type.textContent = frame.messageType ?? (frame.protobufLike ? "—" : "");
-  if (frame.messageType) type.title = frame.messageType;
+  const typeName = resolved?.messageType ?? frame.messageType ?? null;
+  type.textContent = typeName ?? (frame.protobufLike ? "—" : "");
+  if (typeName) {
+    if (resolved?.typeSource === "manual") {
+      type.title = `${typeName} (chosen by you)`;
+      type.className = "type--chosen";
+    } else if (resolved?.typeSource === "remembered") {
+      type.title = `${typeName} (reused for this message shape)`;
+      type.className = "type--remembered";
+    } else {
+      type.title = typeName;
+    }
+  }
 
   row.append(time, dir, conn, size, formatCell, status, type);
   return row;
@@ -554,6 +627,18 @@ function updateMessageCount(visible = visibleFrames().length, start = 0): void {
   if (shown < visible) parts.push(`rendering last ${shown}`);
   if (dropped > 0) parts.push(`${dropped} evicted by retention limit`);
   el<HTMLSpanElement>("message-count").textContent = parts.join(" · ");
+}
+
+/** Replaces one rendered row in place, preserving selection and scroll. */
+function refreshRow(id: string): void {
+  const frame = state.frames.find((candidate) => candidate.id === id);
+  const row = el<HTMLTableSectionElement>("message-body").querySelector<HTMLTableRowElement>(
+    `tr[data-frame-id="${id}"]`,
+  );
+  if (!frame || !row) return;
+  const replacement = buildRow(frame);
+  replacement.classList.toggle("is-selected", frame.id === state.selectedFrameId);
+  row.replaceWith(replacement);
 }
 
 function selectFrame(id: string): void {
@@ -636,12 +721,12 @@ function payloadBytes(frame: FrameMetadata): Uint8Array | null {
 function renderDecodeTypeOptions(frame: FrameMetadata): void {
   const select = el<HTMLSelectElement>("decode-type-select");
   const options = messageTypeOptions(state.schema?.root ?? null);
+
+  // What to show: a choice made for this frame, else the type reused for its
+  // wire shape, else whatever was decoded. Nothing is guessed.
   const preferred =
-    state.chosenTypes.get(frame.id) ??
-    frame.messageType ??
-    state.lastChosenType ??
-    state.settings.defaultMessageType ??
-    "";
+    chosenTypeFor(frame) ?? rememberedTypeFor(frame) ?? frame.messageType ?? "";
+
   select.replaceChildren();
   const none = document.createElement("option");
   none.value = "";
@@ -656,11 +741,12 @@ function renderDecodeTypeOptions(frame: FrameMetadata): void {
   if (preferred && !options.includes(preferred)) {
     const option = document.createElement("option");
     option.value = preferred;
-    option.textContent = `${preferred} (not found in schema)`;
+    option.textContent = `${preferred} (not in the loaded schemas)`;
     select.append(option);
   }
   select.value = preferred;
 }
+
 
 function renderActiveTab(frame: FrameMetadata): void {
   for (const panel of document.querySelectorAll<HTMLElement>(".tab-panel")) {
@@ -694,34 +780,126 @@ function renderActiveTab(frame: FrameMetadata): void {
   }
 }
 
-function decodeTypeFor(frame: FrameMetadata): string | null {
-  return (
-    state.chosenTypes.get(frame.id) ??
-    frame.messageType ??
-    state.lastChosenType ??
-    state.settings.defaultMessageType
-  );
+/** A type the user picked for this exact frame. */
+function chosenTypeFor(frame: FrameMetadata): string | null {
+  return state.chosenTypes.get(frame.id) ?? null;
+}
+
+/**
+ * A type the user picked for a different frame with the same wire shape,
+ * when reuse is enabled. Passed separately from `chosenTypeFor` so the UI can
+ * say which of the two applied.
+ */
+function rememberedTypeFor(frame: FrameMetadata): string | null {
+  if (!state.settings.reusePickedSchema) return null;
+  const shape = shapeOf(frame);
+  if (!shape) return null;
+  return state.typeByShape.get(shape) ?? null;
+}
+
+/** Changes whenever the inputs that decide a decode change. */
+function decodeCacheKey(frame: FrameMetadata): string {
+  return [
+    frame.id,
+    state.chosenTypes.get(frame.id) ?? "",
+    state.typeByShape.get(shapeOf(frame) ?? "") ?? "",
+    String(state.settings.reusePickedSchema),
+    state.schema?.files.join(",") ?? "",
+    frame.kind,
+  ].join("|");
+}
+
+function cachedDecode(frame: FrameMetadata, bytes: Uint8Array): DecodeOutcome {
+  const key = decodeCacheKey(frame);
+  const hit = state.outcomes.get(frame.id);
+  if (hit && hit.key === key) return hit.outcome;
+  const outcome = currentDecode(frame, bytes);
+  state.outcomes.set(frame.id, { key, outcome });
+  return outcome;
 }
 
 function currentDecode(frame: FrameMetadata, bytes: Uint8Array): DecodeOutcome {
-  const messageType = decodeTypeFor(frame);
   return decodeFrame({
     bytes,
     isTextFrame: frame.kind === "text",
     root: state.schema?.root ?? null,
-    messageType,
-    envelope: state.settings.envelope,
+    messageType: chosenTypeFor(frame),
+    rememberedType: rememberedTypeFor(frame),
     wireLimits: { maxDepth: state.settings.maxNestedDepth },
   });
+}
+
+/** Cached wire shape for a frame, or null when its payload is not loaded. */
+function shapeOf(frame: FrameMetadata): string | null {
+  const cached = state.shapes.get(frame.id);
+  if (cached !== undefined) return cached;
+  const payload = state.payloads.get(frame.id);
+  if (!payload) return null;
+  let shape: string | null = null;
+  try {
+    shape = wireShape(base64ToBytes(payload.base64));
+  } catch {
+    shape = null;
+  }
+  state.shapes.set(frame.id, shape);
+  return shape;
+}
+
+const TYPE_SOURCE_LABEL: Record<NonNullable<DecodeOutcome["typeSource"]>, string> = {
+  manual: "chosen by you",
+  remembered: "reused for this message shape",
+};
+
+function renderTypeSource(outcome: DecodeOutcome | null): void {
+  const label = el<HTMLParagraphElement>("type-source");
+  if (!outcome || !outcome.messageType || !outcome.typeSource) {
+    label.hidden = true;
+    label.textContent = "";
+    return;
+  }
+  label.hidden = false;
+  label.dataset.source = outcome.typeSource;
+  const parts = [`Type: ${outcome.messageType} — ${TYPE_SOURCE_LABEL[outcome.typeSource]}`];
+  if (outcome.typeSource === "remembered") {
+    parts.push("applies to messages with the same shape");
+  }
+  label.textContent = parts.join(" · ");
+  // Always reflect the type actually used. Clearing this for a manual choice
+  // left the picker on "No schema" while the JSON beside it was decoded.
+  syncTypePicker(outcome.messageType);
+}
+
+/**
+ * Keeps the picker showing the type that was actually used.
+ *
+ * Clears it when `messageType` is null: an ambiguous frame has no single
+ * answer, and naming one in the picker would contradict the warning above.
+ */
+function syncTypePicker(messageType: string | null): void {
+  const select = el<HTMLSelectElement>("decode-type-select");
+  if (!messageType) {
+    select.value = "";
+    return;
+  }
+  let option = Array.from(select.options).find((candidate) => candidate.value === messageType);
+  if (!option) {
+    option = document.createElement("option");
+    option.value = messageType;
+    option.textContent = messageType;
+    select.append(option);
+  }
+  select.value = messageType;
 }
 
 function renderDecodedTab(frame: FrameMetadata, bytes: Uint8Array | null, waiting: boolean): void {
   const output = el<HTMLPreElement>("decoded-output");
   if (waiting) {
+    renderTypeSource(null);
     output.textContent = "Loading payload…";
     return;
   }
   if (frame.kind === "text") {
+    renderTypeSource(null);
     const text = state.payloads.get(frame.id)?.text ?? null;
     output.textContent = text === null
       ? "This is a text frame."
@@ -729,16 +907,19 @@ function renderDecodedTab(frame: FrameMetadata, bytes: Uint8Array | null, waitin
     return;
   }
   if (bytes === null) {
+    renderTypeSource(null);
     output.textContent = "The payload is no longer available (it may have been evicted).";
     return;
   }
   const autoDecode = state.settings.autoDecode || state.forcedDecodes.has(frame.id);
   if (!autoDecode && !state.chosenTypes.has(frame.id)) {
+    renderTypeSource(null);
     output.textContent =
       "Automatic decoding is off. Choose a message type and press Decode to inspect this payload.";
     return;
   }
-  const outcome = currentDecode(frame, bytes);
+  const outcome = cachedDecode(frame, bytes);
+  renderTypeSource(outcome);
   if (outcome.status === "decoded") {
     output.replaceChildren(...highlightJson(outcome.json));
     return;
@@ -926,9 +1107,7 @@ function renderDiagnosticsTab(frame: FrameMetadata, bytes: Uint8Array | null): v
 
   if (bytes) {
     const outcome = currentDecode(frame, bytes);
-      rows.push(["Decode status", outcome.status]);
-    if (outcome.messageId !== null) rows.push(["Message id", String(outcome.messageId)]);
-    if (outcome.skippedPrefix > 0) rows.push(["Envelope prefix", `${outcome.skippedPrefix} byte(s) skipped`]);
+    rows.push(["Decode status", outcome.status]);
     rows.push(["Payload bytes", String(outcome.payloadBytes)]);
     if (outcome.error) rows.push(["Decode error", outcome.error]);
     if (outcome.wire instanceof Error) {
@@ -1086,45 +1265,16 @@ async function addSchemaFiles(files: FileList | null): Promise<void> {
 
 function applySettingsToForm(): void {
   el<HTMLInputElement>("input-retention").value = String(state.settings.retentionLimit);
-  el<HTMLInputElement>("input-default-type").value = state.settings.defaultMessageType ?? "";
   el<HTMLInputElement>("input-auto-decode").checked = state.settings.autoDecode;
-  const envelope = state.settings.envelope;
-  el<HTMLInputElement>("input-envelope-enabled").checked = envelope.enabled;
-  el<HTMLInputElement>("input-header-length").value = String(envelope.headerLength);
-  el<HTMLSelectElement>("input-id-encoding").value = envelope.idEncoding ?? "";
-  el<HTMLInputElement>("input-id-offset").value = String(envelope.idOffset);
-  el<HTMLInputElement>("input-payload-offset").value = String(envelope.payloadOffset);
-  el<HTMLTextAreaElement>("input-id-mapping").value = Object.entries(envelope.typeByMessageId)
-    .map(([id, type]) => `${id}=${type}`)
-    .join("\n");
+  el<HTMLInputElement>("input-reuse-schema").checked = state.settings.reusePickedSchema;
 }
 
 function readSettingsForm(): Settings {
   const retention = Number(el<HTMLInputElement>("input-retention").value);
-  const defaultType = el<HTMLInputElement>("input-default-type").value.trim();
-  const mapping: Record<string, string> = {};
-  for (const line of el<HTMLTextAreaElement>("input-id-mapping").value.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-    const eq = trimmed.indexOf("=");
-    if (eq <= 0) continue;
-    const id = trimmed.slice(0, eq).trim();
-    const type = trimmed.slice(eq + 1).trim();
-    if (/^\d+$/.test(id) && type) mapping[id] = type;
-  }
-  const encoding = el<HTMLSelectElement>("input-id-encoding").value;
   return {
     retentionLimit: Number.isFinite(retention) ? retention : state.settings.retentionLimit,
-    envelope: {
-      enabled: el<HTMLInputElement>("input-envelope-enabled").checked,
-      headerLength: Number(el<HTMLInputElement>("input-header-length").value) || 0,
-      idOffset: Number(el<HTMLInputElement>("input-id-offset").value) || 0,
-      payloadOffset: Number(el<HTMLInputElement>("input-payload-offset").value) || 0,
-      typeByMessageId: mapping,
-      ...(encoding ? { idEncoding: encoding as NonNullable<EnvelopeConfig["idEncoding"]> } : {}),
-    },
     autoDecode: el<HTMLInputElement>("input-auto-decode").checked,
-    defaultMessageType: defaultType || null,
+    reusePickedSchema: el<HTMLInputElement>("input-reuse-schema").checked,
     maxNestedDepth: state.settings.maxNestedDepth,
   };
 }
@@ -1153,8 +1303,8 @@ async function exportJson(): Promise<void> {
       bytes,
       isTextFrame: frame.kind === "text",
       root: state.schema?.root ?? null,
-      messageType: decodeTypeFor(frame),
-      envelope: state.settings.envelope,
+      messageType: chosenTypeFor(frame),
+      rememberedType: rememberedTypeFor(frame),
     });
     exported.push({
       id: frame.id,
@@ -1237,11 +1387,9 @@ function wireStaticHandlers(): void {
   el<HTMLButtonElement>("btn-export").addEventListener("click", () => {
     void exportJson();
   });
-  el<HTMLButtonElement>("btn-settings").addEventListener("click", () => {
-    const panel = el<HTMLDivElement>("settings-panel");
-    panel.hidden = !panel.hidden;
-    el<HTMLButtonElement>("btn-settings").setAttribute("aria-expanded", panel.hidden ? "false" : "true");
-  });
+  for (const tab of document.querySelectorAll<HTMLButtonElement>(".view-tab")) {
+    tab.addEventListener("click", () => showView((tab.dataset.view ?? "capture") as PanelView));
+  }
   el<HTMLButtonElement>("btn-save-settings").addEventListener("click", () => {
     const next = readSettingsForm();
     state.settings = next;
@@ -1252,8 +1400,17 @@ function wireStaticHandlers(): void {
       window.setTimeout(() => {
         saved.textContent = "";
       }, 1500);
-      renderFilterOptions();
+      // Envelope and default-type changes alter how every frame decodes, so the
+      // whole table has to be rebuilt rather than leaving stale type cells.
+      state.outcomes.clear();
+      suspendStreaming();
+      renderMessages();
       renderDetail();
+      el<HTMLSpanElement>("settings-saved").textContent = "Saved";
+      window.setTimeout(() => {
+        const savedNow = el<HTMLSpanElement>("settings-saved");
+        if (savedNow.textContent === "Saved") savedNow.textContent = "";
+      }, 1800);
     });
   });
 
@@ -1287,28 +1444,10 @@ function wireStaticHandlers(): void {
     });
   }
   el<HTMLSelectElement>("decode-type-select").addEventListener("change", () => {
-    const frame = selectedFrame();
-    if (!frame) return;
-    const chosen = el<HTMLSelectElement>("decode-type-select").value;
-    if (chosen) {
-      state.chosenTypes.set(frame.id, chosen);
-      state.lastChosenType = chosen;
-    } else {
-      state.chosenTypes.delete(frame.id);
-    }
-    state.forcedDecodes.add(frame.id);
-    renderDecodedTabOnly();
+    applyTypeChoice();
   });
   el<HTMLButtonElement>("btn-decode").addEventListener("click", () => {
-    const frame = selectedFrame();
-    if (!frame) return;
-    const chosen = el<HTMLSelectElement>("decode-type-select").value;
-    if (chosen) {
-      state.chosenTypes.set(frame.id, chosen);
-      state.lastChosenType = chosen;
-    }
-    state.forcedDecodes.add(frame.id);
-    renderDecodedTabOnly();
+    applyTypeChoice();
   });
   el<HTMLInputElement>("wire-nested").addEventListener("change", (event) => {
     state.showNested = (event.target as HTMLInputElement).checked;
@@ -1316,6 +1455,20 @@ function wireStaticHandlers(): void {
   });
   el<HTMLButtonElement>("btn-copy").addEventListener("click", () => {
     void copySelected();
+  });
+
+  el<HTMLInputElement>("input-reuse-schema").addEventListener("change", (event) => {
+    // The option decides what the table can show, so rebuild rather than patch.
+    state.settings = {
+      ...state.settings,
+      reusePickedSchema: (event.target as HTMLInputElement).checked,
+    };
+    void saveSettings(state.settings);
+    if (!state.settings.reusePickedSchema) state.typeByShape.clear();
+    state.outcomes.clear();
+    suspendStreaming();
+    renderMessages();
+    renderDetail();
   });
 
   el<HTMLButtonElement>("btn-schema").addEventListener("click", () => {
@@ -1338,6 +1491,35 @@ function wireStaticHandlers(): void {
 
   // Deliberately no "panel closed" message: the port's disconnect event in the
   // worker is the reliable signal, and it also covers a crashed panel.
+}
+
+/**
+ * Records the type picked in the dropdown.
+ *
+ * The choice applies to this frame and to every other captured frame with the
+ * same wire shape, because that structure is what determines which types can
+ * decode it. Frames whose shape differs keep their own resolution, so a
+ * different kind of message is never relabelled by mistake.
+ */
+function applyTypeChoice(): void {
+  const frame = selectedFrame();
+  if (!frame) return;
+  const chosen = el<HTMLSelectElement>("decode-type-select").value;
+  if (chosen) state.chosenTypes.set(frame.id, chosen);
+  else state.chosenTypes.delete(frame.id);
+
+  const shape = shapeOf(frame);
+  if (shape) {
+    if (chosen && state.settings.reusePickedSchema) state.typeByShape.set(shape, chosen);
+    else state.typeByShape.delete(shape);
+  }
+  state.forcedDecodes.add(frame.id);
+
+  // Every decode that depended on the old choice is now stale.
+  state.outcomes.clear();
+  suspendStreaming();
+  renderMessages();
+  renderDecodedTabOnly();
 }
 
 function renderDecodedTabOnly(): void {

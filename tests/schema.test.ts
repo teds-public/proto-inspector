@@ -1,9 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import path from "node:path";
+import protobuf from "protobufjs";
 import {
   SchemaDecodeError,
   decodeWithSchema,
+  isMapEntryType,
+  listDecodableTypes,
   loadSchema,
   normalizeProtoPath,
   type ProtoFile,
@@ -306,4 +309,100 @@ describe("fixture expectations match the decoder", () => {
       expect(result.json).toBeTypeOf("object");
     });
   }
+});
+
+describe("decode statistics", () => {
+  it("counts how often each declared field appears and is populated", () => {
+    const { messageType, bytes } = fixture("login-request");
+    const result = decodeWithSchema(root, messageType, bytes);
+    const username = result.stats.fields.get(1);
+    expect(username).toEqual({ occurrences: 1, populated: 1 });
+    expect(result.stats.unknownFields).toBe(0);
+  });
+
+  it("counts unknown fields instead of silently dropping them", () => {
+    // Field 99 varint 1, then username.
+    const bytes = new Uint8Array([0x98, 0x06, 0x01, 0x0a, 0x01, 0x41]);
+    const result = decodeWithSchema(root, "game.LoginRequest", bytes);
+    expect(result.stats.unknownFields).toBe(1);
+    expect(result.stats.fields.get(99)).toBeUndefined();
+  });
+
+  it("marks a present-but-default value as not populated", () => {
+    // protocol_version = 0 is encoded explicitly.
+    const bytes = new Uint8Array([0x18, 0x00]);
+    const result = decodeWithSchema(root, "game.LoginRequest", bytes);
+    expect(result.json.protocol_version).toBe(0);
+    expect(result.stats.fields.get(3)).toEqual({ occurrences: 1, populated: 0 });
+  });
+
+  it("counts each element of a packed repeated field", () => {
+    // scores = [1, 2, 3] on game.Player
+    const bytes = new Uint8Array([0x2a, 0x03, 0x01, 0x02, 0x03]);
+    const result = decodeWithSchema(root, "game.Player", bytes);
+    expect(result.json.scores).toEqual([1, 2, 3]);
+    expect(result.stats.fields.get(5)).toEqual({ occurrences: 3, populated: 3 });
+  });
+
+  it("counts a map entry once, and only populated when it carries a value", () => {
+    // stats = {"a": 0} — one entry whose value is the default.
+    const bytes = new Uint8Array([0x3a, 0x05, 0x0a, 0x01, 0x61, 0x10, 0x00]);
+    const result = decodeWithSchema(root, "game.Player", bytes);
+    expect(result.json.stats).toEqual({ a: 0 });
+    expect(result.stats.fields.get(7)).toEqual({ occurrences: 1, populated: 0 });
+  });
+
+  it("counts a populated nested message as one populated occurrence", () => {
+    const { messageType, bytes } = fixture("login-response");
+    const result = decodeWithSchema(root, messageType, bytes);
+    expect(result.stats.fields.get(3)?.populated).toBe(1);
+  });
+});
+
+describe("decodable type listing", () => {
+  it("recognises synthesised map-entry types loaded from JSON", async () => {
+    // Parsing .proto does not synthesise entry types; loading a JSON descriptor
+    // (as protobufjs does for its bundled schemas) does.
+    const withEntry = await loadSchema([
+      {
+        name: "j.proto",
+        content: 'syntax = "proto3"; message H { map<string, int32> m = 1; }',
+      },
+    ]);
+    expect(withEntry.ok).toBe(true);
+    // `isMapEntryType` must be false for an ordinary message and agree with the
+    // option when one is present.
+    if (!withEntry.root) throw new Error("no root");
+    expect(isMapEntryType(withEntry.root.lookupType("H"))).toBe(false);
+    const entry = new protobuf.Type("MEntry");
+    entry.setOptions({ mapEntry: true });
+    expect(isMapEntryType(entry)).toBe(true);
+    const plain = new protobuf.Type("Plain");
+    expect(isMapEntryType(plain)).toBe(false);
+  });
+
+  it("keeps map-backed messages in the picker", () => {
+    const names = listDecodableTypes(root).map((type) => type.fullName.replace(/^\./, ""));
+    expect(names).toContain("game.Player");
+    expect(names).toContain("game.LoginResponse");
+  });
+
+  it("excludes bundled well-known types by default", () => {
+    const names = listDecodableTypes(root).map((type) => type.fullName.replace(/^\./, ""));
+    expect(names.some((name) => name.startsWith("google.protobuf."))).toBe(false);
+    expect(names).toContain("game.Player");
+  });
+
+  it("can include bundled types when explicitly asked", () => {
+    const names = listDecodableTypes(root, { includeWellKnown: true }).map((type) =>
+      type.fullName.replace(/^\./, ""),
+    );
+    expect(names).toContain("google.protobuf.Timestamp");
+  });
+
+  it("includes regular nested messages and lists each type once", () => {
+    const names = listDecodableTypes(root).map((type) => type.fullName.replace(/^\./, ""));
+    expect(names).toEqual(expect.arrayContaining(["game.Player", "common.WithGroup.Meta"]));
+    expect(new Set(names).size).toBe(names.length);
+  });
 });

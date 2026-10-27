@@ -251,16 +251,6 @@ textarea {
   resize: vertical;
 }
 
-.envelope {
-  margin-top: 10px;
-}
-
-.envelope summary {
-  cursor: pointer;
-  font-weight: 600;
-  margin-bottom: 6px;
-}
-
 /* Layout ----------------------------------------------------------- */
 
 .layout {
@@ -768,3 +758,104 @@ textarea {
   white-space: nowrap;
   border: 0;
 }
+
+.type-source {
+  margin: 0 0 6px;
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+
+.type--chosen {
+  font-weight: 600;
+}
+
+.type--remembered {
+  color: var(--receive);
+  font-style: italic;
+}
+
+/* View tabs -------------------------------------------------------- */
+
+.view-tabs {
+  display: flex;
+  gap: 2px;
+  padding: 0 12px;
+  background: var(--bg-alt);
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+
+.view-tab {
+  font: inherit;
+  font-size: 12px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: none;
+  color: var(--text-muted);
+  padding: 7px 14px;
+  cursor: pointer;
+}
+
+.view-tab:hover {
+  color: var(--text);
+}
+
+.view-tab.is-active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+  font-weight: 600;
+}
+
+.view {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.view[hidden] {
+  display: none;
+}
+
+/* The settings view scrolls as a whole and is not a pane layout. */
+#view-settings {
+  overflow: auto;
+}
+
+#view-settings .settings {
+  border-bottom: 0;
+  max-height: none;
+}
+
+.capture-notices:empty {
+  display: none;
+}
+
+.settings__block {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 4px;
+}
+
+.field--narrow {
+  max-width: 260px;
+}
+
+.settings__checks {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.capture-toolbar {
+  display: flex;
+  gap: 6px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-alt);
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+}
+

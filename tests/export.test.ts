@@ -143,19 +143,37 @@ describe("settings validation", () => {
     const result = validateSettings({
       retentionLimit: 1000,
       autoDecode: false,
-      defaultMessageType: " game.ChatMessage ",
+      reusePickedSchema: false,
       maxNestedDepth: 8,
-      envelope: { enabled: true, headerLength: 2 },
     });
     expect(result.retentionLimit).toBe(1000);
     expect(result.autoDecode).toBe(false);
-    expect(result.defaultMessageType).toBe("game.ChatMessage");
+    expect(result.reusePickedSchema).toBe(false);
     expect(result.maxNestedDepth).toBe(8);
-    expect(result.envelope.enabled).toBe(true);
   });
 
-  it("treats a blank message type as absent", () => {
-    expect(validateSettings({ defaultMessageType: "   " }).defaultMessageType).toBeNull();
+  it("ignores settings removed in earlier versions", () => {
+    // These must not resurrect themselves from an old stored blob.
+    const result = validateSettings({
+      defaultMessageType: "game.ChatMessage",
+      decodeMode: "envelope",
+      envelope: { idLocation: "prefix" },
+      autoDetectTypes: true,
+      filterPossibleSchema: true,
+    });
+    expect(result).not.toHaveProperty("defaultMessageType");
+    expect(result).not.toHaveProperty("decodeMode");
+    expect(result).not.toHaveProperty("envelope");
+    expect(result).not.toHaveProperty("autoDetectTypes");
+    expect(result).not.toHaveProperty("filterPossibleSchema");
+  });
+
+  it("defaults schema reuse to on", () => {
+    expect(validateSettings({}).reusePickedSchema).toBe(true);
+  });
+
+  it("defaults retention to 500", () => {
+    expect(validateSettings({}).retentionLimit).toBe(500);
   });
 });
 

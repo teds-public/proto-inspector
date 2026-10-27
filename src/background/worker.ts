@@ -27,6 +27,7 @@ import {
   type CaptureErrorCode,
   type CaptureMode,
   type CaptureStatus,
+  type FramePayloadResponse,
   type PanelRequest,
   type SnapshotResponse,
   type WorkerEvent,
@@ -340,7 +341,15 @@ function captureFrame(
     ...(decoded.note ? { decodeError: decoded.note } : {}),
   };
   const metadata = session.store.addFrame(captured);
-  broadcast(session, { type: "frame-added", frame: metadata });
+  // Ship the bytes with the frame: the panel decodes immediately, so the table
+  // can name the message type rather than asking for each payload on demand.
+  const payload: FramePayloadResponse = {
+    type: "frame-payload",
+    id: metadata.id,
+    base64: bytesToBase64(decoded.bytes),
+    text: decoded.text,
+  };
+  broadcast(session, { type: "frame-added", frame: metadata, payload });
   const record = session.store.updateConnection(requestId, {});
   if (record) broadcast(session, { type: "connection-updated", record });
 }
