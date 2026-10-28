@@ -33,14 +33,20 @@ export interface DecodeRequest {
   readonly decodeLimits?: Partial<DecodeLimits>;
 
   /**
+   * Type selected by a user-configured auto-decode rule. Sits between an
+   * explicit pick and a shape-remembered one: the rule is configuration the
+   * user wrote, so it beats reuse, but a pick for this exact frame still wins.
+   */
+  readonly ruledType?: string | null;
+  /**
    * Type the user already chose for messages with the same wire shape. Applied
-   * before anything automatic, so an explicit decision is never overridden.
+   * last, so anything more specific is never overridden.
    */
   readonly rememberedType?: string | null;
 }
 
 /** Where `messageType` came from, so the UI never presents a guess as certainty. */
-export type TypeSource = "manual" | "remembered" | null;
+export type TypeSource = "manual" | "rule" | "remembered" | null;
 
 export interface DecodeOutcome {
   readonly status: DecodeStatus;
@@ -93,6 +99,10 @@ export function decodeFrame(request: DecodeRequest): DecodeOutcome {
   // on. Nothing is guessed: an unnamed frame stays at wire-format level.
   let messageType: string | null = request.messageType;
   let typeSource: TypeSource = messageType ? "manual" : null;
+  if (!messageType && request.ruledType) {
+    messageType = request.ruledType;
+    typeSource = "rule";
+  }
   if (!messageType && request.rememberedType) {
     messageType = request.rememberedType;
     typeSource = "remembered";
@@ -204,4 +214,52 @@ function describeLevel(fields: readonly WireField[], depth: number): string {
   }
   // Repeated occurrences collapse: {1,1,1,2} must group with {1,2}.
   return [...new Set(parts)].sort().join(",");
+}
+
+/* ------------------------------------------------------------------ */
+/* Auto-decode rules                                                   */
+/* ------------------------------------------------------------------ */
+
+export interface AutoDecodeRuleLike {
+  readonly fieldNumber: number;
+  readonly fieldValue: number;
+  readonly messageType: string;
+}
+
+export interface RuleMatch {
+  readonly messageType: string;
+  readonly rule: AutoDecodeRuleLike;
+}
+
+/**
+ * Finds the first rule whose field/value pair appears in the payload.
+ *
+ * Only top-level varint fields are considered, because that is what a numeric
+ * discriminator looks like on the wire and what the rule editor describes. A
+ * value that appears elsewhere (inside a nested message, or as a string) will
+ * not match, which keeps the rule honest about what it inspected.
+ */
+export function matchAutoDecodeRule(
+  bytes: Uint8Array,
+  rules: readonly AutoDecodeRuleLike[],
+  limits: WireLimits = DEFAULT_WIRE_LIMITS,
+): RuleMatch | null {
+  if (rules.length === 0 || bytes.byteLength === 0) return null;
+  let parsed: WireParseResult;
+  try {
+    parsed = parseWireFormat(bytes, { ...limits, maxNestedBytes: 0 });
+  } catch {
+    return null;
+  }
+  for (const rule of rules) {
+    const hit = parsed.fields.some(
+      (field) =>
+        field.kind === "varint" &&
+        field.fieldNumber === rule.fieldNumber &&
+        field.value.kind === "safe" &&
+        field.value.value === rule.fieldValue,
+    );
+    if (hit) return { messageType: rule.messageType, rule };
+  }
+  return null;
 }

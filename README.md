@@ -57,9 +57,9 @@ Reloading the extension detaches the debugger, so click **Start capture** again.
 
 ### Screenshots
 
-| Capture tab | Settings tab |
-| --- | --- |
-| ![Capture tab](docs/screenshot-capture-tab.png) | ![Settings tab](docs/screenshot-settings-tab.png) |
+| Capture tab | Searchable schema picker | Settings: Picked schemas |
+| --- | --- | --- |
+| ![Capture tab](docs/screenshot-capture-tab.png) | ![Schema picker with search](docs/screenshot-searchable.png) | ![Picked schemas](docs/screenshot-settings-picked.png) |
 
 ---
 
@@ -132,27 +132,39 @@ The capture controls (**Start capture**, **Stop**, **Pause**, **Clear**, **Expor
 at the top of this tab, next to the data they act on.
 
 - **Connections**: URL, state (`connecting` / `open` / `closed` / `error`), discovery time,
-  and send/receive counts. Select one to filter.
+  and send/receive counts. Select one to filter. The loaded schema count is shown in Settings.
 - **Messages**: time, direction (`SEND` / `RECV`), connection, size, frame format, decode
   status and message type. Search plus connection/direction/status filters. Pause, resume,
   clear, and JSON export.
-- **Detail**, five tabs:
-  1. **Decoded** — JSON from your schema.
-  2. **Wire** — schema-free field view (field number, wire type, raw value, nested guess).
-  3. **Hex** — exact bytes as an offset/hex/ASCII dump.
-  4. **Raw text** — text frames verbatim.
-  5. **Diagnostics** — ids, timings, handshake details, and the exact decode error.
+- **Detail**, six tabs:
+  1. **General** — time, direction, connection, size and frame format.
+  2. **Decoded** — JSON from your schema.
+  3. **Wire** — schema-free field view (field number, wire type, raw value, nested guess).
+  4. **Hex** — exact bytes as an offset/hex/ASCII dump.
+  5. **Raw text** — text frames verbatim.
+  6. **Diagnostics** — ids, timings, handshake details, and the exact decode error.
 
 Rendering is capped at the newest 500 rows; the counter always states how many are shown and
 how many were evicted, so nothing is silently dropped.
 
+The list follows new messages only while you are already at the bottom. Scroll up to read
+something and it stays put; scroll back down and it follows again.
+
+Long lists — the schema picker and the connection filter — become searchable: typing filters
+the options, Enter picks the first match, Escape closes. Short lists keep the plain dropdown.
+
 ### Settings tab
 
-- **Retention limit** — how many messages to keep, **500** by default.
-- **Decode automatically with the loaded schema**
-- **Use the same picked schema for messages with the same shape**
+Settings has four tabs:
 
-Changes apply immediately; there is nothing to save.
+- **General** — retention limit, **500** by default.
+- **Protobuf schemas** — automatic decoding, and loading the `.proto` files.
+- **Picked schemas** — the types you chose, and the option to reuse a choice across messages
+  with the same wire shape.
+- **Auto decode** — rules that pick a schema from a value inside the message, with import and
+  export for backup.
+
+Changes apply when you press **Save settings**; removing a rule applies at once.
 
 ---
 
@@ -217,6 +229,43 @@ decode as they arrive. Turn it off and each message needs its own choice.
 
 Because the choice is yours, it is never overridden: the type shown is always the one you
 picked for that frame or for its shape.
+
+### Auto decode by field value
+
+For protocols that carry a discriminator inside the message, a rule can pick the schema
+without any click. Each rule names a **field**, a **value**, and the schema to use:
+
+| Field | Value | Decode as |
+| --- | --- | --- |
+| 1 | 701 | heartbeat.HeartbeatRecall |
+| 1 | 700 | heartbeat.HeartbeatCall |
+
+When a captured message has a top-level varint field `1` equal to `701`, it decodes as
+`heartbeat.HeartbeatRecall`. Rules are tried top to bottom and the first match wins.
+
+Only top-level **varint** fields are inspected. A value that appears in a nested message, or
+as a string or a length-delimited field, will not match — the rule states exactly what it
+looked at, so a false positive from an unrelated field is not possible.
+
+Resolution order is: your pick for this frame → a matching rule → the schema remembered for
+this shape. A rule beats reuse because it is configuration you wrote deliberately; a pick on
+the frame still beats everything.
+
+Rules can be **exported** and **imported** as JSON, so a working configuration survives a
+browser reset or moves to another machine. An imported file is parsed as JSON and every rule
+is validated; entries that do not fit are dropped and the panel says how many survived.
+
+### Picked schemas
+
+The **Picked schemas** tab lists every schema you chose, either for a specific message or for a
+whole wire shape, so a decision is visible instead of living only on a captured row. The
+option to reuse a choice across messages with the same shape lives here too. This list is
+in-memory: it is cleared when the panel closes or the page navigates.
+
+### Loading schemas
+
+The **Load files** button opens the file picker; the raw file input is hidden. What gets
+loaded, and what failed, is listed under it.
 
 ### Schema-free wire format
 
@@ -319,7 +368,7 @@ DOM-free modules so it can be tested directly.
 
 ```bash
 npm run typecheck   # tsc --noEmit (strict, noUncheckedIndexedAccess, exactOptionalPropertyTypes)
-npm test            # 159 unit tests
+npm test            # 177 unit tests
 npm run test:e2e    # real Chrome: needs Chrome for Testing (see below)
 npm run build
 ```
@@ -341,11 +390,11 @@ npx @puppeteer/browsers install chrome@stable --path "$TMPDIR/cft"
 | Check | Result |
 | --- | --- |
 | `tsc --noEmit` | passes |
-| Unit tests | **159 passed**, 5 files |
+| Unit tests | **177 passed**, 5 files |
 | `npm run build` | produces `dist/extension`; manifest references verified |
 | `npm run package` | ZIP integrity verified, 13 files |
 | `npm audit` | 0 vulnerabilities |
-| e2e `panel-smoke` | **35/35 checks passed** — capture, send/receive counts, schema decode, enum rendering, wire view, hex view, text frames, search filter, settings persistence, malformed frames, CSP enforcement, no-guess behaviour, schema reuse by shape, tab switching, pause/resume, JSON export, clear, stop |
+| e2e `panel-smoke` | **70/70 checks passed** — capture, send/receive counts, schema decode, enum rendering, wire view, hex view, text frames, search filter, settings persistence, malformed frames, CSP enforcement, no-guess behaviour, schema reuse by shape, auto decode rules, rule import/export, settings tabs, status filter, detail General tab, autoscroll, searchable dropdown, tab switching, pause/resume, JSON export, clear, stop |
 | e2e `devtools-panel` | **passed** — 2 frames captured with a real DevTools window open on the same tab |
 
 The e2e run also asserts that the extension page's CSP really blocks inline scripts while

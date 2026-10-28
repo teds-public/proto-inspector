@@ -21,10 +21,23 @@ import {
   type WorkerEvent,
   type WorkerResponse,
 } from "../shared/protocol";
-import { decodeFrame, messageTypeOptions, wireShape, type DecodeOutcome } from "./decode-service";
+import { attachSearchableSelect, refreshSearchableSelect } from "./searchable-select";
+import {
+  decodeFrame,
+  matchAutoDecodeRule,
+  messageTypeOptions,
+  wireShape,
+  type DecodeOutcome,
+} from "./decode-service";
 import { loadSchema, type ProtoFile, type SchemaLoadResult } from "../protobuf/schema";
 import { loadSchemaSet, saveSchemaSet, sanitizeProtoFiles } from "../storage/schema-store";
-import { loadSettings, saveSettings, type Settings } from "../storage/settings";
+import {
+  loadSettings,
+  saveSettings,
+  validateRules,
+  type AutoDecodeRule,
+  type Settings,
+} from "../storage/settings";
 import { parseWireFormat, wireTypeName, type WireField, type WireParseResult } from "../protobuf/wire";
 import {
   buildExportDocument,
@@ -64,7 +77,7 @@ interface PanelState {
   schema: SchemaLoadResult | null;
   protoFiles: ProtoFile[];
   filters: { search: string; connectionId: string; direction: string; status: string };
-  activeTab: "decoded" | "wire" | "hex" | "text" | "diagnostics";
+  activeTab: "general" | "decoded" | "wire" | "hex" | "text" | "diagnostics";
   showNested: boolean;
   /** Message type explicitly chosen per frame, overriding the default. */
   chosenTypes: Map<string, string>;
@@ -99,12 +112,13 @@ const state: PanelState = {
     retentionLimit: 500,
     autoDecode: true,
     reusePickedSchema: true,
+    autoDecodeRules: [],
     maxNestedDepth: 16,
   },
   schema: null,
   protoFiles: [],
   filters: { search: "", connectionId: "", direction: "", status: "" },
-  activeTab: "decoded",
+  activeTab: "general",
   showNested: true,
   chosenTypes: new Map(),
   typeByShape: new Map(),
@@ -302,6 +316,7 @@ function trimLocalFrames(): void {
 /* ------------------------------------------------------------------ */
 
 type PanelView = "capture" | "settings";
+type SettingsView = "general" | "decoding" | "picked" | "schemas";
 
 /**
  * Switches the top-level view.
@@ -321,6 +336,18 @@ function showView(view: PanelView): void {
     // The attach notice and capture errors describe the capture view; leaving
     // them above the settings form would be noise. They reappear on return.
     renderStatus();
+  }
+}
+
+/** Switches between the sections of the Settings tab. */
+function showSettingsView(view: SettingsView): void {
+  for (const tab of document.querySelectorAll<HTMLButtonElement>(".settings-tab")) {
+    const active = tab.dataset.settingsView === view;
+    tab.classList.toggle("is-active", active);
+    tab.setAttribute("aria-selected", active ? "true" : "false");
+  }
+  for (const section of document.querySelectorAll<HTMLElement>(".settings-panel")) {
+    section.hidden = section.id !== `settings-view-${view}`;
   }
 }
 
@@ -446,6 +473,7 @@ function renderFilterOptions(): void {
   }
   select.value = state.connections.has(current) ? current : "";
   state.filters.connectionId = select.value;
+  refreshSearchableSelect(select);
 }
 
 /* ------------------------------------------------------------------ */
@@ -455,8 +483,13 @@ function renderFilterOptions(): void {
 function passesFilters(frame: FrameMetadata): boolean {
   if (state.filters.connectionId && frame.connectionId !== state.filters.connectionId) return false;
   if (state.filters.direction && frame.direction !== state.filters.direction) return false;
-  if (state.filters.status && frame.decodeStatus !== state.filters.status) {
-    return false;
+  if (state.filters.status) {
+    // The stored decodeStatus is what the worker wrote when the frame arrived,
+    // which is always "not-attempted": decoding happens here, on demand. The
+    // badge shows the resolved status, so the filter must read the same value
+    // or a "decoded" filter could never match anything.
+    const status = resolvedDecode(frame)?.status ?? frame.decodeStatus;
+    if (status !== state.filters.status) return false;
   }
   const search = state.filters.search.trim().toLowerCase();
   if (!search) return true;
@@ -481,6 +514,7 @@ function visibleFrames(): FrameMetadata[] {
 function renderMessages(): void {
   const body = el<HTMLTableSectionElement>("message-body");
   streamingSuspended = false;
+  const pinned = isScrolledToBottom();
   body.replaceChildren();
   state.renderedRowCount = 0;
   const frames = visibleFrames();
@@ -493,9 +527,29 @@ function renderMessages(): void {
   state.renderedRowCount = slice.length;
   el<HTMLParagraphElement>("messages-empty").hidden = frames.length > 0;
   updateMessageCount(frames.length, start);
+  scrollToBottomIfPinned(pinned);
 }
 
 let streamingSuspended = false;
+
+/**
+ * Whether the message list was at its bottom when a row arrived.
+ *
+ * Sticky-bottom only applies while the user is already at the end: scrolling up
+ * to read a message must not be undone by the next frame.
+ */
+function isScrolledToBottom(): boolean {
+  const wrap = el<HTMLDivElement>("table-wrap");
+  const remaining = wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight;
+  // A couple of pixels of slack for fractional layout rounding.
+  return remaining <= 2;
+}
+
+function scrollToBottomIfPinned(pinned: boolean): void {
+  if (!pinned) return;
+  const wrap = el<HTMLDivElement>("table-wrap");
+  wrap.scrollTop = wrap.scrollHeight;
+}
 
 function appendRow(frame: FrameMetadata): void {
   const body = el<HTMLTableSectionElement>("message-body");
@@ -513,12 +567,14 @@ function appendRow(frame: FrameMetadata): void {
     renderMessages();
     return;
   }
+  const pinned = isScrolledToBottom();
   body.append(buildRow(frame));
   state.renderedRowCount++;
   while (body.childElementCount > MAX_RENDERED_ROWS) {
     body.firstElementChild?.remove();
   }
   el<HTMLParagraphElement>("messages-empty").hidden = true;
+  scrollToBottomIfPinned(pinned);
 }
 
 /** True when `frame` is exactly the next frame after the last rendered row. */
@@ -607,6 +663,9 @@ function buildRow(frame: FrameMetadata): HTMLTableRowElement {
     if (resolved?.typeSource === "manual") {
       type.title = `${typeName} (chosen by you)`;
       type.className = "type--chosen";
+    } else if (resolved?.typeSource === "rule") {
+      type.title = `${typeName} (auto decode rule)`;
+      type.className = "type--rule";
     } else if (resolved?.typeSource === "remembered") {
       type.title = `${typeName} (reused for this message shape)`;
       type.className = "type--remembered";
@@ -745,6 +804,9 @@ function renderDecodeTypeOptions(frame: FrameMetadata): void {
     select.append(option);
   }
   select.value = preferred;
+  // The option list is rebuilt on every frame change, so the search layer is
+  // reinstalled to match it.
+  refreshSearchableSelect(select);
 }
 
 
@@ -762,6 +824,9 @@ function renderActiveTab(frame: FrameMetadata): void {
   const waiting = bytes === null;
 
   switch (state.activeTab) {
+    case "general":
+      // Metadata is rendered by renderMeta; only visibility is at stake here.
+      return;
     case "decoded":
       renderDecodedTab(frame, bytes, waiting);
       return;
@@ -818,12 +883,26 @@ function cachedDecode(frame: FrameMetadata, bytes: Uint8Array): DecodeOutcome {
   return outcome;
 }
 
+/** The schema an auto-decode rule selects for this payload, if any. */
+function ruledTypeFor(frame: FrameMetadata, bytes: Uint8Array): string | null {
+  const rules = state.settings.autoDecodeRules;
+  if (rules.length === 0 || frame.kind === "text") return null;
+  const match = matchAutoDecodeRule(bytes, rules, {
+    maxMessageBytes: 16 * 1024 * 1024,
+    maxDepth: 1,
+    maxFields: 500,
+    maxNestedBytes: 0,
+  });
+  return match?.messageType ?? null;
+}
+
 function currentDecode(frame: FrameMetadata, bytes: Uint8Array): DecodeOutcome {
   return decodeFrame({
     bytes,
     isTextFrame: frame.kind === "text",
     root: state.schema?.root ?? null,
     messageType: chosenTypeFor(frame),
+    ruledType: ruledTypeFor(frame, bytes),
     rememberedType: rememberedTypeFor(frame),
     wireLimits: { maxDepth: state.settings.maxNestedDepth },
   });
@@ -847,6 +926,7 @@ function shapeOf(frame: FrameMetadata): string | null {
 
 const TYPE_SOURCE_LABEL: Record<NonNullable<DecodeOutcome["typeSource"]>, string> = {
   manual: "chosen by you",
+  rule: "matched an auto decode rule",
   remembered: "reused for this message shape",
 };
 
@@ -1185,12 +1265,12 @@ async function rebuildSchema(): Promise<void> {
   renderSchemaSummary();
   if (state.protoFiles.length === 0) {
     state.schema = null;
-    renderSchemaDialog();
+    renderSchemaFileList();
     return;
   }
   state.schema = await loadSchema(state.protoFiles);
   renderSchemaSummary();
-  renderSchemaDialog();
+  renderSchemaFileList();
   renderDetail();
 }
 
@@ -1206,7 +1286,7 @@ function renderSchemaSummary(): void {
     : `${state.protoFiles.length} file(s), schema has errors`;
 }
 
-function renderSchemaDialog(): void {
+function renderSchemaFileList(): void {
   const list = el<HTMLUListElement>("schema-file-list");
   list.replaceChildren();
   for (const file of state.protoFiles) {
@@ -1267,6 +1347,203 @@ function applySettingsToForm(): void {
   el<HTMLInputElement>("input-retention").value = String(state.settings.retentionLimit);
   el<HTMLInputElement>("input-auto-decode").checked = state.settings.autoDecode;
   el<HTMLInputElement>("input-reuse-schema").checked = state.settings.reusePickedSchema;
+  renderRuleRows();
+  renderPickedSchemas();
+}
+
+/** Renders one editable row per rule, plus a blank row for adding. */
+function renderRuleRows(): void {
+  const body = el<HTMLTableSectionElement>("rule-rows");
+  body.replaceChildren();
+  const types = messageTypeOptions(state.schema?.root ?? null);
+  state.settings.autoDecodeRules.forEach((rule, index) => {
+    body.append(buildRuleRow(rule, types, index));
+  });
+  const note = el<HTMLSpanElement>("rules-note");
+  note.textContent =
+    state.settings.autoDecodeRules.length === 0
+      ? "No rules yet."
+      : `${state.settings.autoDecodeRules.length} rule(s).`;
+}
+
+function buildRuleRow(
+  rule: AutoDecodeRule,
+  types: readonly string[],
+  index: number,
+): HTMLTableRowElement {
+  const row = document.createElement("tr");
+
+  const fieldCell = document.createElement("td");
+  const fieldInput = document.createElement("input");
+  fieldInput.type = "number";
+  fieldInput.min = "1";
+  fieldInput.value = String(rule.fieldNumber);
+  fieldInput.dataset.ruleField = "fieldNumber";
+  fieldCell.append(fieldInput);
+
+  const valueCell = document.createElement("td");
+  const valueInput = document.createElement("input");
+  valueInput.type = "number";
+  valueInput.min = "0";
+  valueInput.value = String(rule.fieldValue);
+  valueInput.dataset.ruleField = "fieldValue";
+  valueCell.append(valueInput);
+
+  const typeCell = document.createElement("td");
+  const select = document.createElement("select");
+  select.dataset.ruleField = "messageType";
+  const options = types.includes(rule.messageType) ? types : [rule.messageType, ...types];
+  for (const type of options) {
+    const option = document.createElement("option");
+    option.value = type;
+    option.textContent = type;
+    select.append(option);
+  }
+  select.value = rule.messageType;
+  typeCell.append(select);
+
+  const actionCell = document.createElement("td");
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.className = "btn btn--small";
+  remove.textContent = "Remove";
+  remove.addEventListener("click", () => {
+    // Remove by position. The rendered index matches the rendered row, and the
+    // table is rebuilt from state after every change, so indices cannot drift.
+    const rows = state.settings.autoDecodeRules.filter((_rule, rowIndex) => rowIndex !== index);
+    state.settings = { ...state.settings, autoDecodeRules: rows };
+    void saveSettings(state.settings);
+    renderRuleRows();
+    refreshesAfterRuleChange();
+  });
+  actionCell.append(remove);
+
+  row.append(fieldCell, valueCell, typeCell, actionCell);
+  return row;
+}
+
+/** Reads the rule table, dropping rows that are not usable. */
+function readRuleRows(): AutoDecodeRule[] {
+  const rows = [...document.querySelectorAll<HTMLTableRowElement>("#rule-rows tr")];
+  const raw = rows.map((row) => {
+    const field = row.querySelector<HTMLInputElement>('[data-rule-field="fieldNumber"]');
+    const value = row.querySelector<HTMLInputElement>('[data-rule-field="fieldValue"]');
+    const type = row.querySelector<HTMLSelectElement>('[data-rule-field="messageType"]');
+    return {
+      fieldNumber: Number(field?.value ?? 0),
+      fieldValue: Number(value?.value ?? 0),
+      messageType: type?.value ?? "",
+    };
+  });
+  return validateRules(raw);
+}
+
+/** Rules change every decode, so the table and detail pane are rebuilt. */
+function refreshesAfterRuleChange(): void {
+  state.outcomes.clear();
+  suspendStreaming();
+  renderMessages();
+  renderDetail();
+}
+
+/** Writes the rule list to a file so a working configuration can be kept. */
+function exportRules(): void {
+  const rules = readRuleRows();
+  const document_ = {
+    format: "proto-inspector-rules",
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    rules,
+  };
+  const blob = new Blob([JSON.stringify(document_, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = `proto-inspector-rules-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
+  anchor.click();
+  window.setTimeout(() => URL.revokeObjectURL(url), 10_000);
+  el<HTMLSpanElement>("rules-transfer-note").textContent = `${rules.length} rule(s) exported.`;
+}
+
+/**
+ * Reads a rules file, replaces the table with its contents and saves.
+ *
+ * A file is untrusted input: it is parsed as JSON and every rule is validated.
+ * An entry that does not fit is dropped rather than rejecting the whole file,
+ * and the count says what actually survived.
+ */
+async function importRules(file: File | null): Promise<void> {
+  const note = el<HTMLSpanElement>("rules-transfer-note");
+  if (!file) return;
+  if (file.size > 1024 * 1024) {
+    note.textContent = "File is larger than 1 MiB.";
+    return;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await file.text());
+  } catch {
+    note.textContent = "Not a JSON file.";
+    return;
+  }
+  const raw: unknown[] | null =
+    typeof parsed === "object" && parsed !== null && Array.isArray((parsed as { rules?: unknown }).rules)
+      ? ((parsed as { rules: unknown[] }).rules)
+      : Array.isArray(parsed)
+        ? (parsed as unknown[])
+        : null;
+  if (!raw) {
+    note.textContent = "No rules array found in the file.";
+    return;
+  }
+  const rules = validateRules(raw);
+  if (rules.length === 0) {
+    note.textContent = `No usable rules in the file (${raw.length} entr${raw.length === 1 ? "y" : "ies"} rejected).`;
+    return;
+  }
+  state.settings = { ...state.settings, autoDecodeRules: rules };
+  await saveSettings(state.settings);
+  renderRuleRows();
+  refreshesAfterRuleChange();
+  const dropped = raw.length - rules.length;
+  note.textContent =
+    dropped > 0
+      ? `Imported ${rules.length} rule(s); ${dropped} invalid entr${dropped === 1 ? "y" : "ies"} ignored.`
+      : `Imported ${rules.length} rule(s).`;
+}
+
+/**
+ * Lists the schemas the user chose, so a decision is visible in Settings and
+ * not only as a label on a captured row. These live in memory only.
+ */
+function renderPickedSchemas(): void {
+  const body = el<HTMLTableSectionElement>("picked-rows");
+  body.replaceChildren();
+  const entries: { scope: string; type: string; shape: string }[] = [];
+  for (const [frameId, type] of state.chosenTypes) {
+    entries.push({ scope: `message ${frameId}`, type, shape: "—" });
+  }
+  for (const [shape, type] of state.typeByShape) {
+    entries.push({ scope: "wire shape", type, shape });
+  }
+  for (const entry of entries) {
+    const row = document.createElement("tr");
+    const scope = document.createElement("td");
+    scope.textContent = entry.scope;
+    const type = document.createElement("td");
+    type.textContent = entry.type;
+    const shape = document.createElement("td");
+    shape.textContent = entry.shape;
+    shape.className = "picked-shape";
+    if (entry.shape.length > 24) shape.title = entry.shape;
+    row.append(scope, type, shape);
+    body.append(row);
+  }
+  const note = el<HTMLParagraphElement>("picked-note");
+  note.textContent =
+    entries.length === 0
+      ? "Nothing picked yet."
+      : `${state.chosenTypes.size} message(s), ${state.typeByShape.size} wire shape(s).`;
 }
 
 function readSettingsForm(): Settings {
@@ -1275,6 +1552,7 @@ function readSettingsForm(): Settings {
     retentionLimit: Number.isFinite(retention) ? retention : state.settings.retentionLimit,
     autoDecode: el<HTMLInputElement>("input-auto-decode").checked,
     reusePickedSchema: el<HTMLInputElement>("input-reuse-schema").checked,
+    autoDecodeRules: readRuleRows(),
     maxNestedDepth: state.settings.maxNestedDepth,
   };
 }
@@ -1390,6 +1668,11 @@ function wireStaticHandlers(): void {
   for (const tab of document.querySelectorAll<HTMLButtonElement>(".view-tab")) {
     tab.addEventListener("click", () => showView((tab.dataset.view ?? "capture") as PanelView));
   }
+  for (const tab of document.querySelectorAll<HTMLButtonElement>(".settings-tab")) {
+    tab.addEventListener("click", () =>
+      showSettingsView((tab.dataset.settingsView ?? "general") as SettingsView),
+    );
+  }
   el<HTMLButtonElement>("btn-save-settings").addEventListener("click", () => {
     const next = readSettingsForm();
     state.settings = next;
@@ -1471,16 +1754,46 @@ function wireStaticHandlers(): void {
     renderDetail();
   });
 
-  el<HTMLButtonElement>("btn-schema").addEventListener("click", () => {
-    renderSchemaDialog();
-    el<HTMLDialogElement>("schema-dialog").showModal();
+  el<HTMLButtonElement>("btn-rules-export").addEventListener("click", () => {
+    exportRules();
   });
-  el<HTMLButtonElement>("btn-schema-close").addEventListener("click", () => {
-    el<HTMLDialogElement>("schema-dialog").close();
+  el<HTMLButtonElement>("btn-rules-import").addEventListener("click", () => {
+    el<HTMLInputElement>("rules-import-file").click();
+  });
+  el<HTMLInputElement>("rules-import-file").addEventListener("change", (event) => {
+    const input = event.target as HTMLInputElement;
+    void importRules(input.files?.[0] ?? null);
+    input.value = "";
+  });
+
+  el<HTMLButtonElement>("btn-add-rule").addEventListener("click", () => {
+    // Append an editable blank row; it is persisted when Save is pressed.
+    const types = messageTypeOptions(state.schema?.root ?? null);
+    const fallback = types[0];
+    if (!fallback) {
+      el<HTMLSpanElement>("rules-note").textContent = "Load a schema first.";
+      return;
+    }
+    const body = el<HTMLTableSectionElement>("rule-rows");
+    body.append(
+      buildRuleRow(
+        { fieldNumber: 1, fieldValue: 0, messageType: fallback },
+        types,
+        body.childElementCount,
+      ),
+    );
+    el<HTMLSpanElement>("rules-note").textContent = "Unsaved rule — press Save settings.";
   });
   el<HTMLInputElement>("schema-files").addEventListener("change", (event) => {
     void addSchemaFiles((event.target as HTMLInputElement).files);
   });
+  // Static filters have a fixed list; enable search only where the list is
+  // long enough to need it.
+  for (const id of ["filter-status", "filter-direction"]) {
+    const control = el<HTMLSelectElement>(id);
+    attachSearchableSelect(control);
+  }
+
   el<HTMLButtonElement>("btn-schema-add").addEventListener("click", () => {
     el<HTMLInputElement>("schema-files").click();
   });
@@ -1519,6 +1832,7 @@ function applyTypeChoice(): void {
   state.outcomes.clear();
   suspendStreaming();
   renderMessages();
+  renderPickedSchemas();
   renderDecodedTabOnly();
 }
 

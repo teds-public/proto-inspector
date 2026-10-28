@@ -212,6 +212,9 @@ async function main() {
       target.click();
     });
     await panel.waitForFunction(() => document.querySelector("#detail-content")?.hidden === false);
+    // The detail pane now opens on General; the decoded output only renders
+    // while its own tab is visible.
+    await panel.click('.tab[data-tab="decoded"]');
     await panel.waitForFunction(() => document.querySelector("#decoded-output")?.textContent?.length > 0);
 
     await panel.select("#decode-type-select", "game.LoginRequest");
@@ -252,6 +255,35 @@ async function main() {
     const diagnosticsHealthy = await panel.$eval("#detail-content", (el) => !el.hidden);
     check(diagnosticsHealthy, "detail pane stays rendered for a text frame");
 
+    // Frame metadata is its own General tab. Earlier steps moved to other
+    // detail tabs, so return to General explicitly and confirm it is the first.
+    await panel.click('.tab[data-tab="general"]');
+    await panel.waitForFunction(() => document.querySelector("#detail-content")?.hidden === false);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const detailTab = await panel.evaluate(() => ({
+      tabs: [...document.querySelectorAll(".tab")].map((tab) => tab.dataset.tab),
+      active: document.querySelector(".tab.is-active")?.dataset.tab,
+      visible: [...document.querySelectorAll(".tab-panel")].filter((p) => !p.hidden).map((p) => p.dataset.panel),
+      labels: [...document.querySelectorAll("#detail-meta dt")].map((dt) => dt.textContent),
+    }));
+    check(detailTab.tabs[0] === "general", "General is the first detail tab");
+    check(detailTab.active === "general", "General becomes active when chosen");
+    check(
+      detailTab.visible.length === 1 && detailTab.visible[0] === "general",
+      "General tab shows only the metadata panel",
+    );
+    for (const label of ["Time", "Direction", "Connection", "Size", "Frame"]) {
+      check(detailTab.labels.includes(label), `General tab shows ${label}`);
+    }
+    await panel.click('.tab[data-tab="decoded"]');
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    check(
+      await panel.evaluate(
+        () => document.querySelector("#detail-meta")?.closest(".tab-panel")?.hidden === true,
+      ),
+      "metadata is hidden while another detail tab is open",
+    );
+
     // Search filter must actually re-render, including after streaming.
     await panel.type("#filter-search", "LoginRequest");
     await panel.waitForFunction(() => {
@@ -261,6 +293,90 @@ async function main() {
     const filteredCount = await panel.$$eval("#message-body tr", (rows) => rows.length);
     check(filteredCount === 0, `search filter excludes non-matching rows (${filteredCount} left)`);
     await panel.$eval("#filter-search", (el) => { el.value = ""; el.dispatchEvent(new Event("input", { bubbles: true })); });
+
+    // The message list follows new rows only while it is scrolled to the end.
+    // Shrink the panel so the table certainly overflows; otherwise the check
+    // would silently pass on a list with no scrollbar.
+    await panel.setViewport({ width: 900, height: 420 });
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const scrollState = await panel.evaluate(() => {
+      const wrap = document.getElementById("table-wrap");
+      wrap.scrollTop = wrap.scrollHeight;
+      return {
+        scrollable: wrap.scrollHeight > wrap.clientHeight,
+        atBottom: wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight <= 2,
+      };
+    });
+    check(scrollState.scrollable, "the message list overflows in a short panel");
+    check(scrollState.atBottom, "the list starts pinned to the bottom");
+    await panel.evaluate(() => {
+      document.getElementById("table-wrap").scrollTop = 0;
+    });
+    await page.evaluate(() => window.sendChat());
+    await new Promise((resolve) => setTimeout(resolve, 900));
+    check(
+      await panel.evaluate(() => document.getElementById("table-wrap").scrollTop <= 2),
+      "scrolling up stops the list from following new rows",
+    );
+    await panel.evaluate(() => {
+      const wrap = document.getElementById("table-wrap");
+      wrap.scrollTop = wrap.scrollHeight;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await page.evaluate(() => window.sendChat());
+    await new Promise((resolve) => setTimeout(resolve, 900));
+    check(
+      await panel.evaluate(() => {
+        const wrap = document.getElementById("table-wrap");
+        return wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight <= 2;
+      }),
+      "a list pinned to the bottom follows new rows",
+    );
+    await panel.setViewport({ width: 1400, height: 900 });
+    await new Promise((resolve) => setTimeout(resolve, 400));
+
+    // The schema picker is a searchable dropdown.
+    await panel.click('.tab[data-tab="decoded"]');
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const comboPresent = await panel.evaluate(
+      () => document.querySelector("#decode-type-select")?.nextElementSibling?.classList.contains("searchable-select") === true,
+    );
+    check(comboPresent, "the schema picker has a search box");
+    await panel.focus(".searchable-select__input");
+    await panel.type(".searchable-select__input", "Chat");
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const comboOptions = await panel.$$eval(".searchable-select__option", (options) =>
+      options.map((option) => option.textContent ?? ""),
+    );
+    check(
+      comboOptions.length > 0 && comboOptions.every((label) => label.toLowerCase().includes("chat")),
+      `typing filters the dropdown (${comboOptions.join(", ")})`,
+    );
+    await panel.keyboard.press("Escape");
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    // The status filter must use the decoded status, not the one stored when
+    // the frame was captured (which is always "not-attempted").
+    await panel.select("#filter-status", "decoded");
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    const decodedOnly = await panel.$$eval("#message-body tr", (rows) =>
+      rows.map((row) => row.children[5]?.textContent ?? ""),
+    );
+    check(
+      decodedOnly.length > 0 && decodedOnly.every((status) => status === "decoded"),
+      `decoded filter shows decoded frames (${decodedOnly.length})`,
+    );
+    await panel.select("#filter-status", "not-attempted");
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    const rawOnly = await panel.$$eval("#message-body tr", (rows) =>
+      rows.map((row) => row.children[5]?.textContent ?? ""),
+    );
+    check(
+      rawOnly.every((status) => status !== "decoded"),
+      `not-decoded filter excludes decoded frames (${rawOnly.length} shown)`,
+    );
+    await panel.select("#filter-status", "");
+    await new Promise((resolve) => setTimeout(resolve, 400));
 
     // The panel is split into two views; switching must not disturb capture.
     await panel.click("#tab-settings");
@@ -369,6 +485,150 @@ async function main() {
     });
     check(inlineRan === false, "extension page CSP blocks inline script injection");
 
+    // Settings is split into two sections, and the file picker is driven only
+    // by the Load files button.
+    await panel.click("#tab-settings");
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const settingsSections = await panel.evaluate(() => ({
+      visible: [...document.querySelectorAll(".settings-panel")].filter((s) => !s.hidden).map((s) => s.id),
+      fileInputHidden: document.getElementById("schema-files").hidden,
+      loadButton: document.getElementById("btn-schema-add") !== null,
+    }));
+    check(
+      settingsSections.visible.length === 1 && settingsSections.visible[0] === "settings-view-general",
+      "Settings opens on the General tab",
+    );
+    check(settingsSections.fileInputHidden, "the raw file input is hidden behind Load files");
+    check(settingsSections.loadButton, "the Load files button is present");
+
+    // Each tab holds the controls it is named for.
+    const tabContents = await panel.evaluate(() => {
+      const panelOf = (id) => document.getElementById(id)?.closest(".settings-panel")?.id ?? "";
+      const result = {};
+      for (const name of ["general", "decoding", "picked", "schemas"]) {
+        document.getElementById(`settings-tab-${name}`).click();
+        result[name] = [...document.querySelectorAll(".settings-panel")]
+          .filter((s) => !s.hidden)
+          .map((s) => s.id);
+      }
+      return {
+        result,
+        retention: panelOf("input-retention"),
+        reuse: panelOf("input-reuse-schema"),
+        autoDecode: panelOf("input-auto-decode"),
+      };
+    });
+    const tabOrder = await panel.$$eval(".settings-tab", (tabs) =>
+      tabs.map((tab) => tab.dataset.settingsView),
+    );
+    check(
+      JSON.stringify(tabOrder) === JSON.stringify(["general", "schemas", "picked", "decoding"]),
+      `settings tabs are ordered as asked (${tabOrder.join(", ")})`,
+    );
+    for (const name of ["general", "decoding", "picked", "schemas"]) {
+      check(
+        tabContents.result[name].length === 1 && tabContents.result[name][0] === `settings-view-${name}`,
+        `${name} tab shows only its own section`,
+      );
+    }
+    check(tabContents.retention === "settings-view-general", "retention limit lives in General");
+    check(tabContents.reuse === "settings-view-picked", "schema reuse lives in Picked schemas");
+    check(tabContents.autoDecode === "settings-view-schemas", "auto decode lives in Protobuf schemas");
+    await panel.click("#settings-tab-decoding");
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    // Rules can be exported and imported back.
+    await panel.click("#btn-add-rule");
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await panel.evaluate(() => {
+      const row = document.querySelector("#rule-rows tr");
+      row.querySelector('[data-rule-field="fieldNumber"]').value = "1";
+      row.querySelector('[data-rule-field="fieldValue"]').value = "700";
+      row.querySelector('[data-rule-field="messageType"]').value = "game.LoginRequest";
+    });
+    await panel.click("#btn-rules-export");
+    const exportedRules = await waitFor(
+      async () => {
+        const file = fs
+          .readdirSync(downloadDir)
+          .find((name) => name.startsWith("proto-inspector-rules-"));
+        return file ? path.join(downloadDir, file) : "";
+      },
+      10_000,
+      "exported rules file",
+    );
+    const rulesDoc = JSON.parse(fs.readFileSync(exportedRules, "utf8"));
+    check(rulesDoc.format === "proto-inspector-rules", "rules export has the expected format");
+    check(rulesDoc.rules.length === 1, `rules export contains the rule (${rulesDoc.rules.length})`);
+
+    // Importing the same file restores it after clearing.
+    await panel.evaluate(() => document.querySelector("#rule-rows tr button")?.click());
+    await waitFor(
+      async () => (await panel.$$eval("#rule-rows tr", (rows) => rows.length)) === 0,
+      5_000,
+      "rules table to empty",
+    );
+    await (await panel.$("#rules-import-file")).uploadFile(exportedRules);
+    await waitFor(
+      async () => (await panel.$$eval("#rule-rows tr", (rows) => rows.length)) === 1,
+      10_000,
+      "rules to be imported",
+    );
+    console.log("  ok  a rule round-trips through export and import");
+
+    // Clear the imported rule so later checks start from an empty list.
+    await panel.evaluate(() => document.querySelector("#rule-rows tr button")?.click());
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    // Schemas now live in Settings, and an auto-decode rule can pick a type
+    // from a value inside the message.
+    check(
+      await panel.evaluate(() => document.getElementById("btn-schema") === null),
+      "the Schemas button is gone from the capture view",
+    );
+    check(
+      await panel.evaluate(() => document.getElementById("schema-files") !== null),
+      "schemas are loaded from the Settings tab",
+    );
+    await panel.click("#btn-add-rule");
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await panel.evaluate(() => {
+      const row = document.querySelector("#rule-rows tr");
+      if (!row) throw new Error("no rule row");
+      row.querySelector('[data-rule-field="fieldNumber"]').value = "3";
+      row.querySelector('[data-rule-field="fieldValue"]').value = "7";
+      row.querySelector('[data-rule-field="messageType"]').value = "game.LoginRequest";
+    });
+    await panel.click("#btn-save-settings");
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    const storedRules = await panel.evaluate(async () => {
+      const stored = await chrome.storage.local.get("protoInspector.settings");
+      return stored["protoInspector.settings"]?.autoDecodeRules ?? [];
+    });
+    check(
+      Array.isArray(storedRules) && storedRules.some((rule) => rule.fieldValue === 7),
+      `auto decode rule persisted (${JSON.stringify(storedRules)})`,
+    );
+    await panel.click("#tab-capture");
+    await page.evaluate(() => window.sendLogin());
+    await new Promise((resolve) => setTimeout(resolve, 1400));
+    const ruleDecoded = await waitFor(
+      async () =>
+        panel.$$eval("#message-body tr", (rows) =>
+          rows.filter((row) => row.children[6]?.className === "type--rule").length,
+        ),
+      10_000,
+      "a frame decoded by rule",
+    );
+    check(ruleDecoded > 0, `a rule decodes the frame without a pick (${ruleDecoded} rows)`);
+    // Remove the rule so the later steps start from a clean state.
+    await panel.click("#tab-settings");
+    await panel.evaluate(() => {
+      document.querySelector("#rule-rows tr button")?.click();
+    });
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    await panel.click("#tab-capture");
+
     // Choosing a schema decodes the frame; nothing is guessed automatically.
     await page.evaluate(() => window.sendLogin());
     await new Promise((resolve) => setTimeout(resolve, 1200));
@@ -416,8 +676,10 @@ async function main() {
     );
     check(remembered > 0, `a picked schema is reused for the same shape (${remembered} rows)`);
 
-    // Turning the option off stops the reuse.
+    // Turning the option off stops the reuse. It lives in the Picked tab.
     await panel.click("#tab-settings");
+    await panel.click("#settings-tab-picked");
+    await new Promise((resolve) => setTimeout(resolve, 300));
     await panel.click("#input-reuse-schema");
     await new Promise((resolve) => setTimeout(resolve, 700));
     await panel.click("#tab-capture");
@@ -426,6 +688,8 @@ async function main() {
     );
     check(afterOff === 0, "disabling the option stops schema reuse");
     await panel.click("#tab-settings");
+    await panel.click("#settings-tab-picked");
+    await new Promise((resolve) => setTimeout(resolve, 300));
     await panel.click("#input-reuse-schema");
     await new Promise((resolve) => setTimeout(resolve, 500));
     await panel.click("#tab-capture");
@@ -452,7 +716,9 @@ async function main() {
     await panel.click("#btn-export");
     const exportFile = await waitFor(
       async () => {
-        const files = fs.readdirSync(downloadDir).filter((name) => name.endsWith(".json"));
+        const files = fs
+          .readdirSync(downloadDir)
+          .filter((name) => name.endsWith(".json") && !name.startsWith("proto-inspector-rules-"));
         return files[0] ?? "";
       },
       10_000,

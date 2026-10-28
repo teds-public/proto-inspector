@@ -7,6 +7,19 @@
 
 import { clampRetention, DEFAULT_RETENTION } from "../capture/store";
 
+/**
+ * A rule that picks a schema from a value inside the message.
+ *
+ * Evaluated against the top-level wire fields: when field `fieldNumber` carries
+ * the varint `fieldValue`, `messageType` is used. This is configuration the
+ * user wrote, not a guess, so it outranks the schema remembered for a shape.
+ */
+export interface AutoDecodeRule {
+  readonly fieldNumber: number;
+  readonly fieldValue: number;
+  readonly messageType: string;
+}
+
 export interface Settings {
   readonly retentionLimit: number;
   /** Decode each frame on arrival using the schema chosen for it. */
@@ -16,6 +29,8 @@ export interface Settings {
    * same wire shape. A decision the user made, never a guess.
    */
   readonly reusePickedSchema: boolean;
+  /** Ordered; the first rule whose field matches wins. */
+  readonly autoDecodeRules: readonly AutoDecodeRule[];
   readonly maxNestedDepth: number;
 }
 
@@ -23,6 +38,7 @@ export const DEFAULT_SETTINGS: Settings = {
   retentionLimit: DEFAULT_RETENTION,
   autoDecode: true,
   reusePickedSchema: true,
+  autoDecodeRules: [],
   maxNestedDepth: 16,
 };
 
@@ -41,8 +57,32 @@ export function validateSettings(raw: unknown): Settings {
     retentionLimit: retention,
     autoDecode: record.autoDecode !== false,
     reusePickedSchema: record.reusePickedSchema !== false,
+    autoDecodeRules: validateRules(record.autoDecodeRules),
     maxNestedDepth: depth,
   };
+}
+
+/** Drops malformed rules rather than letting one bad entry disable matching. */
+export function validateRules(raw: unknown): AutoDecodeRule[] {
+  if (!Array.isArray(raw)) return [];
+  const rules: AutoDecodeRule[] = [];
+  const seen = new Set<string>();
+  for (const entry of raw) {
+    if (typeof entry !== "object" || entry === null) continue;
+    const record = entry as Record<string, unknown>;
+    const fieldNumber = record.fieldNumber;
+    const fieldValue = record.fieldValue;
+    const messageType = record.messageType;
+    if (typeof fieldNumber !== "number" || !Number.isInteger(fieldNumber)) continue;
+    if (fieldNumber < 1 || fieldNumber > 536_870_911) continue;
+    if (typeof fieldValue !== "number" || !Number.isSafeInteger(fieldValue) || fieldValue < 0) continue;
+    if (typeof messageType !== "string" || messageType.trim().length === 0) continue;
+    const key = `${fieldNumber}:${fieldValue}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    rules.push({ fieldNumber, fieldValue, messageType: messageType.trim() });
+  }
+  return rules;
 }
 
 function storageArea(): chrome.storage.StorageArea | null {
