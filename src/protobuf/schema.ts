@@ -85,13 +85,18 @@ const WELL_KNOWN = new Set([
   "google/protobuf/json_enumvalue_options.proto",
 ]);
 
-/** Adds the bundled `google/protobuf/*` types and returns the names it added. */
-function addWellKnownTypes(root: protobuf.Root): Set<string> {
+/**
+ * Adds the bundled `google/protobuf/*` types and returns the names it added.
+ *
+ * A file the user supplied wins over the bundled copy: loading their own
+ * `google/protobuf/struct.proto` must not collide with the built-in one.
+ */
+function addWellKnownTypes(root: protobuf.Root, provided: ReadonlySet<string>): Set<string> {
   const added = new Set<string>();
   const bundled = protobuf.common as unknown as Record<string, unknown> | undefined;
   if (!bundled) return added;
   for (const [name, json] of Object.entries(bundled)) {
-    if (name === "get" || !WELL_KNOWN.has(name)) continue;
+    if (name === "get" || !WELL_KNOWN.has(name) || provided.has(name)) continue;
     const nested = (json as { nested?: unknown }).nested;
     if (!nested) continue;
     root.addJSON(nested as Record<string, never>);
@@ -143,7 +148,7 @@ export async function loadSchema(files: readonly ProtoFile[]): Promise<SchemaLoa
   }
 
   const root = new protobuf.Root();
-  const wellKnownNames = addWellKnownTypes(root);
+  const wellKnownNames = addWellKnownTypes(root, new Set(normalized.keys()));
 
   const parsed: ParsedFile[] = [];
   for (const [name, file] of normalized) {
@@ -186,6 +191,12 @@ export async function loadSchema(files: readonly ProtoFile[]): Promise<SchemaLoa
   for (const file of parsed) {
     const scope = file.result.package ? root.lookup(file.result.package) : root;
     const start = scope && "nestedArray" in scope ? scope : root;
+    if (WELL_KNOWN.has(file.name)) {
+      const messages: string[] = [];
+      const enums: string[] = [];
+      walkTypes(start as protobuf.NamespaceBase, messages, enums, new Set());
+      for (const name of [...messages, ...enums]) wellKnownNames.add(name);
+    }
     walkTypes(start as protobuf.NamespaceBase, messageTypes, enumTypes, seen);
   }
   // Include types contributed by imports even when no file declared them, but

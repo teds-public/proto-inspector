@@ -21,6 +21,12 @@ import {
   type WireParseResult,
 } from "../protobuf/wire";
 import type { JsonValue } from "../protobuf/json-value";
+import {
+  opcodeTypeFor,
+  splitFrame,
+  type FramePrefixMode,
+  type OpcodeRegistry,
+} from "../protobuf/opcode";
 import type { DecodeStatus } from "../shared/model";
 
 export interface DecodeRequest {
@@ -31,6 +37,16 @@ export interface DecodeRequest {
   readonly messageType: string | null;
   readonly wireLimits?: Partial<WireLimits>;
   readonly decodeLimits?: Partial<DecodeLimits>;
+
+  /**
+   * Frame direction, used to choose between the request and response type
+   * declared for an opcode. Defaults to `send`.
+   */
+  readonly direction?: "send" | "receive";
+  /** How a frame's opcode prefix is detected; defaults to `none`. */
+  readonly prefixMode?: FramePrefixMode;
+  /** Opcode → request/response types read from the loaded schema. */
+  readonly opcodes?: OpcodeRegistry;
 
   /**
    * Type selected by a user-configured auto-decode rule. Sits between an
@@ -46,7 +62,7 @@ export interface DecodeRequest {
 }
 
 /** Where `messageType` came from, so the UI never presents a guess as certainty. */
-export type TypeSource = "manual" | "rule" | "remembered" | null;
+export type TypeSource = "manual" | "rule" | "remembered" | "opcode" | null;
 
 export interface DecodeOutcome {
   readonly status: DecodeStatus;
@@ -56,6 +72,8 @@ export interface DecodeOutcome {
   readonly typeSource: TypeSource;
   readonly payloadBytes: number;
   readonly wire: WireParseResult | WireFormatError | null;
+  /** Opcode read from the frame prefix, when one was detected. */
+  readonly opcode: number | null;
 }
 
 export function defaultWireLimits(overrides: Partial<WireLimits> = {}): WireLimits {
@@ -82,6 +100,7 @@ export function decodeFrame(request: DecodeRequest): DecodeOutcome {
     messageType: null as string | null,
     typeSource: null as TypeSource,
     payloadBytes: request.bytes.byteLength,
+    opcode: null as number | null,
   };
 
   if (request.bytes.byteLength === 0) {
@@ -91,17 +110,42 @@ export function decodeFrame(request: DecodeRequest): DecodeOutcome {
     return { ...base, status: "skipped-text", json: null, error: null, wire: null };
   }
 
-  const payload = request.bytes;
+  const split = splitFrame(
+    request.bytes,
+    request.prefixMode ?? "none",
+    request.opcodes ?? new Map(),
+  );
+  const payload = split.payload;
+  // An opcode-only frame (a ping, or a request with no body) has nothing to
+  // decode, which is different from a frame that was never attempted.
+  if (payload.byteLength === 0) {
+    return {
+      ...base,
+      status: "payload-empty",
+      json: null,
+      error: null,
+      wire: null,
+      opcode: split.opcode,
+    };
+  }
   const wire = wireOutcome(payload, wireLimits);
 
-  // The user's choice for this frame wins. Otherwise a type they picked earlier
-  // for the same wire shape is used, when the "reuse picked schema" option is
-  // on. Nothing is guessed: an unnamed frame stays at wire-format level.
+  // The user's choice for this frame wins. A rule they wrote beats the type the
+  // schema declares for the frame's opcode, which in turn beats a type reused
+  // from another frame with the same shape. Nothing is guessed: an unnamed
+  // frame stays at wire-format level.
   let messageType: string | null = request.messageType;
   let typeSource: TypeSource = messageType ? "manual" : null;
   if (!messageType && request.ruledType) {
     messageType = request.ruledType;
     typeSource = "rule";
+  }
+  if (!messageType && split.opcode !== null && request.opcodes) {
+    const fromOpcode = opcodeTypeFor(request.opcodes, split.opcode, request.direction ?? "send");
+    if (fromOpcode) {
+      messageType = fromOpcode;
+      typeSource = "opcode";
+    }
   }
   if (!messageType && request.rememberedType) {
     messageType = request.rememberedType;
@@ -119,6 +163,7 @@ export function decodeFrame(request: DecodeRequest): DecodeOutcome {
         typeSource,
         payloadBytes: payload.byteLength,
         wire,
+        opcode: split.opcode,
       };
     } catch (error) {
       return {
@@ -129,6 +174,7 @@ export function decodeFrame(request: DecodeRequest): DecodeOutcome {
         typeSource,
         payloadBytes: payload.byteLength,
         wire,
+        opcode: split.opcode,
       };
     }
   }
@@ -144,6 +190,7 @@ export function decodeFrame(request: DecodeRequest): DecodeOutcome {
       typeSource: null,
       payloadBytes: payload.byteLength,
       wire,
+      opcode: split.opcode,
     };
   }
   return {
@@ -154,6 +201,7 @@ export function decodeFrame(request: DecodeRequest): DecodeOutcome {
     typeSource: null,
     payloadBytes: payload.byteLength,
     wire,
+    opcode: split.opcode,
   };
 }
 

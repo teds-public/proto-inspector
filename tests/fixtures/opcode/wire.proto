@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package fixture.wire;
+
+// Opcode registry used by the end-to-end test. The panel reads these comments
+// to name the type of a frame that starts with a 4-byte opcode.
+enum WireOpcode {
+  WIRE_OPCODE_UNSPECIFIED = 0;
+
+  // opcode: 1001
+  // request: LoginRequest
+  // response: LoginResponse
+  WIRE_LOGIN = 1001;
+}
+
+message LoginRequest {
+  string username = 1;
+  string password = 2;
+}
+
+message LoginResponse {
+  bool ok = 1;
+}

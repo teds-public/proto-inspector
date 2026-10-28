@@ -1,0 +1,7 @@
+syntax = "proto3";
+
+package fixture.realtime;
+
+message Meta {
+  int32 opcode = 1;
+}

@@ -22,6 +22,7 @@ import {
   type WorkerResponse,
 } from "../shared/protocol";
 import { attachSearchableSelect, refreshSearchableSelect } from "./searchable-select";
+import { isNoiseFile, relativeProtoPath as resolveRelativePath } from "./schema-files";
 import {
   decodeFrame,
   matchAutoDecodeRule,
@@ -30,9 +31,11 @@ import {
   type DecodeOutcome,
 } from "./decode-service";
 import { loadSchema, type ProtoFile, type SchemaLoadResult } from "../protobuf/schema";
+import { readOpcodeRegistry, splitFrame, type OpcodeRegistry } from "../protobuf/opcode";
 import { loadSchemaSet, saveSchemaSet, sanitizeProtoFiles } from "../storage/schema-store";
 import {
   loadSettings,
+  parseFramePrefix,
   saveSettings,
   validateRules,
   type AutoDecodeRule,
@@ -96,6 +99,8 @@ interface PanelState {
   outcomes: Map<string, { readonly key: string; readonly outcome: DecodeOutcome }>;
   /** Wire shape per frame, cached because it is recomputed for every row. */
   shapes: Map<string, string | null>;
+  /** Opcode → types declared by the loaded schema's enum comments. */
+  opcodes: OpcodeRegistry;
   renderedRowCount: number;
 }
 
@@ -110,6 +115,7 @@ const state: PanelState = {
   payloads: new Map(),
   settings: {
     retentionLimit: 500,
+    framePrefix: "auto",
     autoDecode: true,
     reusePickedSchema: true,
     autoDecodeRules: [],
@@ -125,6 +131,7 @@ const state: PanelState = {
   forcedDecodes: new Set(),
   outcomes: new Map(),
   shapes: new Map(),
+  opcodes: new Map(),
   renderedRowCount: 0,
 };
 
@@ -669,6 +676,9 @@ function buildRow(frame: FrameMetadata): HTMLTableRowElement {
     } else if (resolved?.typeSource === "remembered") {
       type.title = `${typeName} (reused for this message shape)`;
       type.className = "type--remembered";
+    } else if (resolved?.typeSource === "opcode") {
+      type.title = `${typeName} (from opcode ${resolved.opcode}, declared in the loaded schema)`;
+      type.className = "type--opcode";
     } else {
       type.title = typeName;
     }
@@ -748,6 +758,17 @@ function renderMeta(frame: FrameMetadata): void {
   addMeta(meta, "Connection", connection?.url ?? frame.connectionId);
   addMeta(meta, "Size", `${frame.size} bytes (${formatBytes(frame.size)})`);
   addMeta(meta, "Frame", `${frame.kind} (opcode ${frame.opcode})`);
+  const bytes = payloadBytes(frame);
+  if (bytes !== null) {
+    const split = splitFrame(bytes, state.settings.framePrefix, state.opcodes);
+    if (split.prefixed) {
+      addMeta(
+        meta,
+        "Opcode prefix",
+        `${split.opcode} (4 bytes), ${split.payload.byteLength} payload byte(s)`,
+      );
+    }
+  }
   if (frame.messageType) addMeta(meta, "Message type", frame.messageType);
   if (frame.wireSummary?.length) {
     addMeta(
@@ -822,6 +843,8 @@ function renderActiveTab(frame: FrameMetadata): void {
 
   const bytes = payloadBytes(frame);
   const waiting = bytes === null;
+  // The wire view shows the protobuf body; an opcode prefix is not a field.
+  const body = bytes === null ? null : frameBody(bytes);
 
   switch (state.activeTab) {
     case "general":
@@ -831,7 +854,7 @@ function renderActiveTab(frame: FrameMetadata): void {
       renderDecodedTab(frame, bytes, waiting);
       return;
     case "wire":
-      renderWireTab(bytes, waiting);
+      renderWireTab(body, waiting);
       return;
     case "hex":
       renderHexTab(bytes, waiting);
@@ -869,6 +892,7 @@ function decodeCacheKey(frame: FrameMetadata): string {
     state.chosenTypes.get(frame.id) ?? "",
     state.typeByShape.get(shapeOf(frame) ?? "") ?? "",
     String(state.settings.reusePickedSchema),
+    state.settings.framePrefix,
     state.schema?.files.join(",") ?? "",
     frame.kind,
   ].join("|");
@@ -887,7 +911,9 @@ function cachedDecode(frame: FrameMetadata, bytes: Uint8Array): DecodeOutcome {
 function ruledTypeFor(frame: FrameMetadata, bytes: Uint8Array): string | null {
   const rules = state.settings.autoDecodeRules;
   if (rules.length === 0 || frame.kind === "text") return null;
-  const match = matchAutoDecodeRule(bytes, rules, {
+  // Rules inspect fields of the protobuf body, so an opcode prefix is removed
+  // first; otherwise field 1 of the body would appear at the wrong offset.
+  const match = matchAutoDecodeRule(frameBody(bytes), rules, {
     maxMessageBytes: 16 * 1024 * 1024,
     maxDepth: 1,
     maxFields: 500,
@@ -904,8 +930,19 @@ function currentDecode(frame: FrameMetadata, bytes: Uint8Array): DecodeOutcome {
     messageType: chosenTypeFor(frame),
     ruledType: ruledTypeFor(frame, bytes),
     rememberedType: rememberedTypeFor(frame),
+    direction: frame.direction,
+    prefixMode: state.settings.framePrefix,
+    opcodes: state.opcodes,
     wireLimits: { maxDepth: state.settings.maxNestedDepth },
   });
+}
+
+/**
+ * The protobuf body of a frame: the frame's bytes with any opcode prefix
+ * removed. Every decoder works on this, never on the raw frame.
+ */
+function frameBody(bytes: Uint8Array): Uint8Array {
+  return splitFrame(bytes, state.settings.framePrefix, state.opcodes).payload;
 }
 
 /** Cached wire shape for a frame, or null when its payload is not loaded. */
@@ -916,7 +953,7 @@ function shapeOf(frame: FrameMetadata): string | null {
   if (!payload) return null;
   let shape: string | null = null;
   try {
-    shape = wireShape(base64ToBytes(payload.base64));
+    shape = wireShape(frameBody(base64ToBytes(payload.base64)));
   } catch {
     shape = null;
   }
@@ -928,6 +965,7 @@ const TYPE_SOURCE_LABEL: Record<NonNullable<DecodeOutcome["typeSource"]>, string
   manual: "chosen by you",
   rule: "matched an auto decode rule",
   remembered: "reused for this message shape",
+  opcode: "from the opcode in the loaded schema",
 };
 
 function renderTypeSource(outcome: DecodeOutcome | null): void {
@@ -942,6 +980,9 @@ function renderTypeSource(outcome: DecodeOutcome | null): void {
   const parts = [`Type: ${outcome.messageType} — ${TYPE_SOURCE_LABEL[outcome.typeSource]}`];
   if (outcome.typeSource === "remembered") {
     parts.push("applies to messages with the same shape");
+  }
+  if (outcome.typeSource === "opcode" && outcome.opcode !== null) {
+    parts.push(`opcode ${outcome.opcode}, ${outcome.payloadBytes} payload byte(s)`);
   }
   label.textContent = parts.join(" · ");
   // Always reflect the type actually used. Clearing this for a manual choice
@@ -1018,7 +1059,17 @@ function renderDecodedTab(frame: FrameMetadata, bytes: Uint8Array | null, waitin
     return;
   }
   if (outcome.status === "wire-error") {
-    output.textContent = `This payload is not valid protobuf: ${outcome.error ?? "unknown error"}\n\nUse the Hex tab to inspect the raw bytes.`;
+    // The common cause here is a framed protocol: an opcode or length header
+    // in front of the message. Naming it is more useful than the byte offset.
+    const bytes = state.payloads.get(frame.id);
+    const framed = bytes ? /field number 0 at byte 0/.test(outcome.error ?? "") : false;
+    output.textContent = framed
+      ? `This payload is not valid protobuf: ${outcome.error ?? "unknown error"}\n\n` +
+        "The first bytes are not a protobuf field, which usually means the frame starts with a " +
+        "header such as an opcode. If your protocol does that and the opcode is declared in a " +
+        "loaded schema enum (a `// opcode: N` comment), set **Settings → General → Frame prefix** " +
+        "to detect it. Otherwise use the Hex tab to inspect the raw bytes."
+      : `This payload is not valid protobuf: ${outcome.error ?? "unknown error"}\n\nUse the Hex tab to inspect the raw bytes.`;
     return;
   }
   output.textContent =
@@ -1189,6 +1240,12 @@ function renderDiagnosticsTab(frame: FrameMetadata, bytes: Uint8Array | null): v
     const outcome = currentDecode(frame, bytes);
     rows.push(["Decode status", outcome.status]);
     rows.push(["Payload bytes", String(outcome.payloadBytes)]);
+    if (outcome.opcode !== null) {
+      rows.push([
+        "Opcode prefix",
+        `${outcome.opcode} (uint32 big-endian), stripped before decoding`,
+      ]);
+    }
     if (outcome.error) rows.push(["Decode error", outcome.error]);
     if (outcome.wire instanceof Error) {
       rows.push(["Wire parse", outcome.wire.message]);
@@ -1265,12 +1322,20 @@ async function rebuildSchema(): Promise<void> {
   renderSchemaSummary();
   if (state.protoFiles.length === 0) {
     state.schema = null;
+    state.opcodes = new Map();
+    state.outcomes.clear();
+    state.shapes.clear();
     renderSchemaFileList();
+    renderMessages();
     return;
   }
   state.schema = await loadSchema(state.protoFiles);
+  state.opcodes = readOpcodeRegistry(state.schema.root);
+  state.outcomes.clear();
+  state.shapes.clear();
   renderSchemaSummary();
   renderSchemaFileList();
+  renderMessages();
   renderDetail();
 }
 
@@ -1284,6 +1349,29 @@ function renderSchemaSummary(): void {
   summary.textContent = state.schema?.ok
     ? `${state.protoFiles.length} file(s), ${types} message type(s)`
     : `${state.protoFiles.length} file(s), schema has errors`;
+  renderOpcodeSummary();
+}
+
+/**
+ * Says how many opcodes the schema declares, so frame-prefix detection is
+ * visible rather than a hidden precondition.
+ */
+function renderOpcodeSummary(): void {
+  const summary = el<HTMLDivElement>("opcode-summary");
+  const entries = [...state.opcodes.values()];
+  if (entries.length === 0) {
+    summary.hidden = true;
+    summary.textContent = "";
+    return;
+  }
+  const unresolved = entries.filter((entry) => entry.request === null && entry.response === null).length;
+  summary.hidden = false;
+  summary.textContent =
+    `${entries.length} opcode(s) declared in the schema (${entries
+      .slice(0, 6)
+      .map((entry) => entry.opcode)
+      .join(", ")}${entries.length > 6 ? ", …" : ""}).` +
+    (unresolved > 0 ? ` ${unresolved} without a resolvable request/response type.` : "");
 }
 
 function renderSchemaFileList(): void {
@@ -1314,28 +1402,57 @@ function renderSchemaFileList(): void {
   ].join("\n");
 }
 
-async function addSchemaFiles(files: FileList | null): Promise<void> {
+/** Path of a picked file relative to the chosen folder; see schema-files.ts. */
+function relativeProtoPath(file: File): string | null {
+  const raw = (file as File & { webkitRelativePath?: string }).webkitRelativePath;
+  return resolveRelativePath(file.name, raw);
+}
+
+async function addSchemaFiles(files: FileList | null, folderMode: boolean): Promise<void> {
   if (!files || files.length === 0) return;
   const incoming: ProtoFile[] = [];
   const problems: string[] = [];
+  let ignored = 0;
   for (const file of Array.from(files)) {
+    // Noise only appears in folder mode, where these sit next to the schemas.
+    if (!file.name.toLowerCase().endsWith(".proto")) {
+      if (folderMode && isNoiseFile(file.name)) {
+        ignored++;
+        continue;
+      }
+      problems.push(`${file.name}: only .proto files are accepted`);
+      continue;
+    }
     if (file.size > 2 * 1024 * 1024) {
       problems.push(`${file.name}: file is larger than 2 MiB`);
       continue;
     }
-    incoming.push({ name: file.name, content: await file.text() });
+    const name = relativeProtoPath(file);
+    if (!name) {
+      problems.push(`${file.name}: could not determine its path`);
+      continue;
+    }
+    incoming.push({ name, content: await file.text() });
   }
-  const sanitized = sanitizeProtoFiles(incoming);
-  problems.push(...sanitized.errors.map((error) => `${error.file || "(schema)"}: ${error.message}`));
+
   const byName = new Map(state.protoFiles.map((file) => [file.name, file]));
-  for (const file of sanitized.files) byName.set(file.name, file);
-  state.protoFiles = [...byName.values()];
-  await saveSchemaSet(state.protoFiles);
-  await rebuildSchema();
-  if (problems.length > 0) {
+  for (const file of incoming) byName.set(file.name, file);
+  const sanitized = sanitizeProtoFiles([...byName.values()]);
+  if (sanitized.errors.length > 0) {
+    // Keep the set that is already loaded rather than persisting a partial one.
+    problems.push(...sanitized.errors.map((error) => `${error.file || "(schema)"}: ${error.message}`));
+  } else {
+    state.protoFiles = [...sanitized.files];
+    await saveSchemaSet(state.protoFiles);
+    await rebuildSchema();
+  }
+
+  const lines = [...problems];
+  if (ignored > 0) lines.push(`Ignored ${ignored} non-.proto file(s) such as .meta.`);
+  if (lines.length > 0) {
     const errors = el<HTMLDivElement>("schema-errors");
     errors.hidden = false;
-    errors.textContent = problems.join("\n");
+    errors.textContent = lines.join("\n");
   }
 }
 
@@ -1345,6 +1462,7 @@ async function addSchemaFiles(files: FileList | null): Promise<void> {
 
 function applySettingsToForm(): void {
   el<HTMLInputElement>("input-retention").value = String(state.settings.retentionLimit);
+  el<HTMLSelectElement>("input-frame-prefix").value = state.settings.framePrefix;
   el<HTMLInputElement>("input-auto-decode").checked = state.settings.autoDecode;
   el<HTMLInputElement>("input-reuse-schema").checked = state.settings.reusePickedSchema;
   renderRuleRows();
@@ -1550,6 +1668,7 @@ function readSettingsForm(): Settings {
   const retention = Number(el<HTMLInputElement>("input-retention").value);
   return {
     retentionLimit: Number.isFinite(retention) ? retention : state.settings.retentionLimit,
+    framePrefix: parseFramePrefix(el<HTMLSelectElement>("input-frame-prefix").value),
     autoDecode: el<HTMLInputElement>("input-auto-decode").checked,
     reusePickedSchema: el<HTMLInputElement>("input-reuse-schema").checked,
     autoDecodeRules: readRuleRows(),
@@ -1577,13 +1696,7 @@ async function exportJson(): Promise<void> {
     } catch {
       continue;
     }
-    const outcome = decodeFrame({
-      bytes,
-      isTextFrame: frame.kind === "text",
-      root: state.schema?.root ?? null,
-      messageType: chosenTypeFor(frame),
-      rememberedType: rememberedTypeFor(frame),
-    });
+    const outcome = currentDecode(frame, bytes);
     exported.push({
       id: frame.id,
       connectionId: frame.connectionId,
@@ -1683,9 +1796,10 @@ function wireStaticHandlers(): void {
       window.setTimeout(() => {
         saved.textContent = "";
       }, 1500);
-      // Envelope and default-type changes alter how every frame decodes, so the
-      // whole table has to be rebuilt rather than leaving stale type cells.
+      // Frame-prefix and auto-decode changes alter how every frame decodes, so
+      // the whole table has to be rebuilt rather than leaving stale type cells.
       state.outcomes.clear();
+      state.shapes.clear();
       suspendStreaming();
       renderMessages();
       renderDetail();
@@ -1762,8 +1876,11 @@ function wireStaticHandlers(): void {
   });
   el<HTMLInputElement>("rules-import-file").addEventListener("change", (event) => {
     const input = event.target as HTMLInputElement;
-    void importRules(input.files?.[0] ?? null);
-    input.value = "";
+    // Clear the input only after the file has been read: emptying it can
+    // invalidate the File handle while `text()` is still pending.
+    void importRules(input.files?.[0] ?? null).finally(() => {
+      input.value = "";
+    });
   });
 
   el<HTMLButtonElement>("btn-add-rule").addEventListener("click", () => {
@@ -1785,7 +1902,10 @@ function wireStaticHandlers(): void {
     el<HTMLSpanElement>("rules-note").textContent = "Unsaved rule — press Save settings.";
   });
   el<HTMLInputElement>("schema-files").addEventListener("change", (event) => {
-    void addSchemaFiles((event.target as HTMLInputElement).files);
+    const input = event.target as HTMLInputElement;
+    void addSchemaFiles(input.files, false).finally(() => {
+      input.value = "";
+    });
   });
   // Static filters have a fixed list; enable search only where the list is
   // long enough to need it.
@@ -1796,6 +1916,15 @@ function wireStaticHandlers(): void {
 
   el<HTMLButtonElement>("btn-schema-add").addEventListener("click", () => {
     el<HTMLInputElement>("schema-files").click();
+  });
+  el<HTMLButtonElement>("btn-schema-folder").addEventListener("click", () => {
+    el<HTMLInputElement>("schema-folder").click();
+  });
+  el<HTMLInputElement>("schema-folder").addEventListener("change", (event) => {
+    const input = event.target as HTMLInputElement;
+    void addSchemaFiles(input.files, true).finally(() => {
+      input.value = "";
+    });
   });
   el<HTMLButtonElement>("btn-schema-clear").addEventListener("click", () => {
     state.protoFiles = [];

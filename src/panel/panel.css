@@ -843,6 +843,11 @@ textarea {
   max-width: 260px;
 }
 
+/* For a field whose longest option must stay readable in the closed control. */
+.field--wide {
+  max-width: 460px;
+}
+
 .settings__checks {
   display: flex;
   flex-direction: column;
@@ -903,6 +908,10 @@ textarea {
   font-style: italic;
 }
 
+.type--opcode {
+  color: var(--accent);
+}
+
 /* Settings sub-tabs ------------------------------------------------- */
 
 .settings-tabs {
@@ -934,6 +943,19 @@ textarea {
 }
 
 .settings-panel[hidden] {
+  display: none;
+}
+
+/* One line between each segment of a settings section, so a long hint does
+   not run into the control below it. */
+.settings-panel > * + * {
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+  margin-top: 12px;
+}
+
+/* An empty list would otherwise draw its separator over nothing. */
+.settings-panel > :empty {
   display: none;
 }
 

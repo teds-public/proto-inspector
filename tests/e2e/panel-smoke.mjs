@@ -433,6 +433,105 @@ async function main() {
       "saved retention",
     );
     check(storedRetention === 250, `retention setting persisted (${storedRetention})`);
+
+    // A frame that starts with a 4-byte opcode is split and typed from the
+    // opcode comments in the loaded schema.
+    await panel.evaluate(() => document.getElementById("settings-tab-schemas").click());
+    await (await panel.$("#schema-files")).uploadFile(
+      path.join(root, "tests", "fixtures", "opcode", "wire.proto"),
+    );
+    await waitFor(
+      async () =>
+        /opcode\(s\) declared/.test(
+          (await panel.evaluate(() => document.getElementById("opcode-summary")?.textContent)) ?? "",
+        ),
+      10_000,
+      "the opcode summary",
+    );
+    console.log("  ok  the schema's opcode comments are loaded");
+    await panel.evaluate(() => document.getElementById("settings-tab-general").click());
+    const prefixMode = await panel.$eval("#input-frame-prefix", (el) => el.value);
+    check(prefixMode === "auto", `frame prefix defaults to auto-detection (${prefixMode})`);
+    await panel.click("#tab-capture");
+
+    // 00 00 03 e9 | field 1 "TESTER" — the exact shape of the captured frames.
+    await page.evaluate(() => {
+      const body = new Uint8Array([0x0a, 0x06, ...new TextEncoder().encode("TESTER")]);
+      const frame = new Uint8Array(4 + body.length);
+      new DataView(frame.buffer).setUint32(0, 1001, false);
+      frame.set(body, 4);
+      window.openSocket().send(frame);
+    });
+    await waitFor(
+      async () =>
+        (await panel.$$eval("#message-body tr", (rows) =>
+          rows.some((row) => row.children[6]?.className === "type--opcode"),
+        )) === true,
+      15_000,
+      "a frame typed from its opcode",
+    );
+    const opcodeRow = await panel.$$eval("#message-body tr", (rows) => {
+      const row = rows.find((entry) => entry.children[6]?.className === "type--opcode");
+      return {
+        type: row?.children[6]?.textContent ?? "",
+        title: row?.children[6]?.title ?? "",
+      };
+    });
+    check(
+      opcodeRow.type === "fixture.wire.LoginRequest",
+      `an opcode-prefixed frame is named from the schema (${opcodeRow.type})`,
+    );
+    check(
+      /opcode 1001/.test(opcodeRow.title),
+      `the row says which opcode named it (${opcodeRow.title})`,
+    );
+    await panel.evaluate(() => {
+      const rows = [...document.querySelectorAll("#message-body tr")];
+      rows[rows.length - 1]?.click();
+    });
+    await panel.click('.tab[data-tab="decoded"]');
+    const opcodeDecoded = await waitFor(
+      async () => {
+        const text = await panel.evaluate(
+          () => document.getElementById("decoded-output")?.textContent ?? "",
+        );
+        return text.includes("TESTER") ? text : "";
+      },
+      10_000,
+      "the opcode frame to decode",
+    );
+    check(
+      opcodeDecoded.includes("username"),
+      "the body decodes after the opcode is stripped",
+    );
+    // Put the setting back to a clean state for the later checks.
+    await panel.evaluate(() => document.getElementById("settings-tab-schemas").click());
+    await panel.evaluate(() => document.getElementById("btn-schema-clear")?.click());
+    await waitFor(
+      async () =>
+        (await panel.evaluate(() => document.getElementById("schema-summary")?.textContent)) ===
+        "No schema loaded",
+      5000,
+      "schemas to clear after the opcode check",
+    );
+    await (await panel.$("#schema-files")).uploadFile(
+      ...schemas.map((schema) => {
+        const target = path.join(profileDir, "upload", schema.name);
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.writeFileSync(target, schema.content);
+        return target;
+      }),
+    );
+    await waitFor(
+      async () =>
+        /^3 file\(s\)/.test(
+          (await panel.evaluate(() => document.getElementById("schema-summary")?.textContent)) ?? "",
+        ),
+      5000,
+      "bundled schemas to reload after the opcode check",
+    );
+    // Leave the settings view on the tab a fresh open shows.
+    await panel.evaluate(() => document.getElementById("settings-tab-general").click());
     await panel.click("#tab-capture");
 
     // Malformed frames must still be captured and reported without crashing.
@@ -442,10 +541,15 @@ async function main() {
     check(afterMalformed > rowCount, `malformed frames were still captured (${afterMalformed} rows)`);
 
     // The Hex tab was left active above, so switch back to Decoded before
-    // reading that panel's output.
+    // reading that panel's output. Select a row that decodes first, so the
+    // change below is observable; otherwise a wire-error row already selected
+    // would make the wait below time out.
     await panel.click('.tab[data-tab="decoded"]');
-    // Wait for the detail pane to change, otherwise the previous selection's
-    // output would be read back and the check would pass vacuously.
+    await panel.evaluate(() => {
+      const rows = [...document.querySelectorAll("#message-body tr")];
+      rows.find((row) => row.children[6]?.className === "type--chosen")?.click();
+    });
+    await new Promise((resolve) => setTimeout(resolve, 400));
     const previousText = await panel.$eval("#decoded-output", (el) => el.textContent ?? "");
     await panel.evaluate(() => {
       const rows = [...document.querySelectorAll("#message-body tr")];
@@ -493,6 +597,9 @@ async function main() {
       visible: [...document.querySelectorAll(".settings-panel")].filter((s) => !s.hidden).map((s) => s.id),
       fileInputHidden: document.getElementById("schema-files").hidden,
       loadButton: document.getElementById("btn-schema-add") !== null,
+      folderInputHidden: document.getElementById("schema-folder")?.hidden,
+      folderInputIsDirectory: document.getElementById("schema-folder")?.hasAttribute("webkitdirectory"),
+      folderButton: document.getElementById("btn-schema-folder") !== null,
     }));
     check(
       settingsSections.visible.length === 1 && settingsSections.visible[0] === "settings-view-general",
@@ -500,6 +607,11 @@ async function main() {
     );
     check(settingsSections.fileInputHidden, "the raw file input is hidden behind Load files");
     check(settingsSections.loadButton, "the Load files button is present");
+    check(
+      settingsSections.folderInputIsDirectory && settingsSections.folderInputHidden,
+      "the Load folder input accepts a directory tree and stays hidden",
+    );
+    check(settingsSections.folderButton, "the Load folder button is present");
 
     // Each tab holds the controls it is named for.
     const tabContents = await panel.evaluate(() => {
@@ -534,6 +646,79 @@ async function main() {
     check(tabContents.retention === "settings-view-general", "retention limit lives in General");
     check(tabContents.reuse === "settings-view-picked", "schema reuse lives in Picked schemas");
     check(tabContents.autoDecode === "settings-view-schemas", "auto decode lives in Protobuf schemas");
+
+    // A folder pick keeps the tree, so a folder-relative import resolves, and
+    // the .meta files Unity puts next to every asset are skipped quietly.
+    await panel.click("#settings-tab-schemas");
+    const folderInput = await panel.$("#schema-folder");
+    await folderInput.uploadFile(path.join(root, "tests", "fixtures", "proto-folder"));
+    await waitFor(
+      async () =>
+        (await panel.$$eval("#schema-file-list li span:first-child", (nodes) =>
+          nodes.map((node) => node.textContent),
+        )).includes("realtime/realtime.proto"),
+      10_000,
+      "folder schemas to appear",
+    );
+    const folderState = await panel.evaluate(() => {
+      const errors = document.getElementById("schema-errors");
+      return {
+        names: [...document.querySelectorAll("#schema-file-list li span:first-child")].map(
+          (node) => node.textContent,
+        ),
+        summary: document.getElementById("schema-summary")?.textContent ?? "",
+        errors: errors?.hidden ? "" : errors?.textContent ?? "",
+      };
+    });
+    check(
+      folderState.names.includes("lobby.proto") && folderState.names.includes("realtime/realtime.proto"),
+      "folder loading keeps paths relative to the chosen folder",
+    );
+    check(
+      !folderState.names.some((name) => name.endsWith(".meta")),
+      "folder loading ignores .meta files",
+    );
+    check(
+      /Ignored 3 non-\.proto file\(s\)/.test(folderState.errors) &&
+        !/only \.proto files are accepted/.test(folderState.errors),
+      `skipped .meta files are counted, not reported as failures (${folderState.errors})`,
+    );
+    check(
+      /5 file\(s\), \d+ message type\(s\)/.test(folderState.summary),
+      `folder schemas merged with the loaded set (${folderState.summary})`,
+    );
+    const folderTypes = await panel.evaluate(() =>
+      [...document.querySelectorAll("#decode-type-select option")].map((option) => option.value),
+    );
+    check(
+      folderTypes.includes("fixture.lobby.LobbyOpened"),
+      "a type behind a folder-relative import is decodable",
+    );
+    // Put the bundled schema back so the checks below decode with it.
+    await panel.evaluate(() => document.getElementById("btn-schema-clear")?.click());
+    await waitFor(
+      async () =>
+        (await panel.evaluate(() => document.getElementById("schema-summary")?.textContent)) ===
+        "No schema loaded",
+      5000,
+      "schemas to clear",
+    );
+    await (await panel.$("#schema-files")).uploadFile(
+      ...schemas.map((schema) => {
+        const target = path.join(profileDir, "upload", schema.name);
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.writeFileSync(target, schema.content);
+        return target;
+      }),
+    );
+    await waitFor(
+      async () =>
+        /^3 file\(s\)/.test(
+          (await panel.evaluate(() => document.getElementById("schema-summary")?.textContent)) ?? "",
+        ),
+      5000,
+      "bundled schemas to reload",
+    );
     await panel.click("#settings-tab-decoding");
     await new Promise((resolve) => setTimeout(resolve, 300));
 
@@ -547,19 +732,33 @@ async function main() {
       row.querySelector('[data-rule-field="messageType"]').value = "game.LoginRequest";
     });
     await panel.click("#btn-rules-export");
-    const exportedRules = await waitFor(
+    // The file appears before it is fully written, so wait for parseable JSON
+    // rather than for the name alone: a partial read makes the import step
+    // fail with "Not a JSON file".
+    const rulesDoc = await waitFor(
       async () => {
         const file = fs
           .readdirSync(downloadDir)
           .find((name) => name.startsWith("proto-inspector-rules-"));
-        return file ? path.join(downloadDir, file) : "";
+        if (!file) return null;
+        try {
+          return {
+            path: path.join(downloadDir, file),
+            doc: JSON.parse(fs.readFileSync(path.join(downloadDir, file), "utf8")),
+          };
+        } catch {
+          return null;
+        }
       },
       10_000,
       "exported rules file",
     );
-    const rulesDoc = JSON.parse(fs.readFileSync(exportedRules, "utf8"));
-    check(rulesDoc.format === "proto-inspector-rules", "rules export has the expected format");
-    check(rulesDoc.rules.length === 1, `rules export contains the rule (${rulesDoc.rules.length})`);
+    const exportedRules = rulesDoc.path;
+    check(rulesDoc.doc.format === "proto-inspector-rules", "rules export has the expected format");
+    check(
+      rulesDoc.doc.rules.length === 1,
+      `rules export contains the rule (${rulesDoc.doc.rules.length})`,
+    );
 
     // Importing the same file restores it after clearing.
     await panel.evaluate(() => document.querySelector("#rule-rows tr button")?.click());
@@ -714,17 +913,23 @@ async function main() {
 
     // Export writes a complete JSON document to disk.
     await panel.click("#btn-export");
-    const exportFile = await waitFor(
+    // Same as the rules file: wait until the JSON parses, not merely until the
+    // file name exists.
+    const exported = await waitFor(
       async () => {
-        const files = fs
+        const file = fs
           .readdirSync(downloadDir)
-          .filter((name) => name.endsWith(".json") && !name.startsWith("proto-inspector-rules-"));
-        return files[0] ?? "";
+          .find((name) => name.endsWith(".json") && !name.startsWith("proto-inspector-rules-"));
+        if (!file) return null;
+        try {
+          return JSON.parse(fs.readFileSync(path.join(downloadDir, file), "utf8"));
+        } catch {
+          return null;
+        }
       },
       10_000,
       "exported JSON file",
     );
-    const exported = JSON.parse(fs.readFileSync(path.join(downloadDir, exportFile), "utf8"));
     check(exported.format === "proto-inspector-export", "export has the expected format tag");
     check(exported.frames.length > 0, `export contains ${exported.frames.length} frames`);
     check(

@@ -105,6 +105,62 @@ describe("schema loading", () => {
     expect(result.warnings.join(" ")).toMatch(/other\.proto/);
   });
 
+  it("loads a folder tree whose imports use folder-relative paths", async () => {
+    const files: ProtoFile[] = [
+      {
+        name: "lobby.proto",
+        content: [
+          'syntax = "proto3";',
+          'package bonus.realtime.lobby;',
+          'import "google/protobuf/struct.proto";',
+          'import "realtime/realtime.proto";',
+          "message LobbyHello {",
+          "  bonus.realtime.RealtimeMeta meta = 1;",
+          "  google.protobuf.Struct payload = 2;",
+          "}",
+        ].join("\n"),
+      },
+      {
+        name: "realtime/realtime.proto",
+        content: [
+          'syntax = "proto3";',
+          "package bonus.realtime;",
+          "message RealtimeMeta { int32 opcode = 1; }",
+        ].join("\n"),
+      },
+      {
+        name: "google/protobuf/struct.proto",
+        content: [
+          'syntax = "proto3";',
+          "package google.protobuf;",
+          "message Struct { map<string, string> fields = 1; }",
+        ].join("\n"),
+      },
+    ];
+    const result = await loadSchema(files);
+    expect(result.errors).toEqual([]);
+    expect(result.ok).toBe(true);
+    expect(result.messageTypes).toContain("bonus.realtime.lobby.LobbyHello");
+    expect(result.messageTypes).toContain("bonus.realtime.RealtimeMeta");
+    // Types the user supplied are their own inventory; bundled types stay out.
+    expect(result.messageTypes).not.toContain("google.protobuf.Timestamp");
+  });
+
+  it("prefers a user-supplied well-known file over the bundled copy", async () => {
+    const result = await loadSchema([
+      {
+        name: "google/protobuf/struct.proto",
+        content: [
+          'syntax = "proto3";',
+          "package google.protobuf;",
+          "message Struct { map<string, string> fields = 1; }",
+        ].join("\n"),
+      },
+    ]);
+    expect(result.ok).toBe(true);
+    expect(result.errors).toEqual([]);
+  });
+
   it("parses a schema with no files as an error", async () => {
     const result = await loadSchema([]);
     expect(result.ok).toBe(false);

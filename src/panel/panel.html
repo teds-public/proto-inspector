@@ -168,6 +168,19 @@
           <input type="number" id="input-retention" min="100" max="50000" step="100" value="500" />
           <span class="field__hint">Oldest messages are dropped first.</span>
         </label>
+        <label class="field field--wide">
+          <span class="field__label">Frame prefix</span>
+          <select id="input-frame-prefix">
+            <option value="auto">Detect a 4-byte opcode when the schema declares it</option>
+            <option value="uint32be">Always skip 4 bytes (uint32 big-endian opcode)</option>
+            <option value="none">None — the frame is the protobuf message</option>
+          </select>
+          <span class="field__hint">
+            Frames that start with an opcode are split before decoding. Detection needs an enum
+            in a loaded schema with a <code>// opcode: N</code> comment, which also names the
+            request and response types.
+          </span>
+        </label>
       </section>
 
       <section class="settings-panel" id="settings-view-schemas" role="tabpanel"
@@ -180,13 +193,18 @@
         <p class="muted">
           Files are parsed locally and never evaluated or uploaded. Imports between uploaded
           files resolve automatically; <code>google/protobuf/*.proto</code> well-known types
-          are built in.
+          are built in. <strong>Load folder</strong> keeps the folder structure, so imports like
+          <code>realtime/realtime.proto</code> resolve, and skips non-schema files such as
+          <code>.meta</code>.
         </p>
         <div class="dialog__row">
           <input type="file" id="schema-files" accept=".proto" multiple hidden />
           <button type="button" id="btn-schema-add" class="btn btn--primary">Load files</button>
+          <input type="file" id="schema-folder" webkitdirectory multiple hidden />
+          <button type="button" id="btn-schema-folder" class="btn">Load folder</button>
         </div>
         <ul class="file-list" id="schema-file-list"></ul>
+        <div class="schema-summary" id="opcode-summary" hidden></div>
         <div class="schema-errors" id="schema-errors" hidden></div>
         <div class="dialog__row">
           <button type="button" id="btn-schema-clear" class="btn">Remove all</button>

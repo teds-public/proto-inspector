@@ -6,6 +6,7 @@
  */
 
 import { clampRetention, DEFAULT_RETENTION } from "../capture/store";
+import type { FramePrefixMode } from "../protobuf/opcode";
 
 /**
  * A rule that picks a schema from a value inside the message.
@@ -22,6 +23,11 @@ export interface AutoDecodeRule {
 
 export interface Settings {
   readonly retentionLimit: number;
+  /**
+   * How a frame's leading opcode is detected and stripped before decoding.
+   * `auto` trusts the opcode numbers declared in the loaded schema.
+   */
+  readonly framePrefix: FramePrefixMode;
   /** Decode each frame on arrival using the schema chosen for it. */
   readonly autoDecode: boolean;
   /**
@@ -36,6 +42,7 @@ export interface Settings {
 
 export const DEFAULT_SETTINGS: Settings = {
   retentionLimit: DEFAULT_RETENTION,
+  framePrefix: "auto",
   autoDecode: true,
   reusePickedSchema: true,
   autoDecodeRules: [],
@@ -43,6 +50,11 @@ export const DEFAULT_SETTINGS: Settings = {
 };
 
 const STORAGE_KEY = "protoInspector.settings";
+
+/** Narrows an untrusted value to a supported frame-prefix mode. */
+export function parseFramePrefix(raw: unknown): FramePrefixMode {
+  return raw === "none" || raw === "uint32be" ? raw : DEFAULT_SETTINGS.framePrefix;
+}
 
 export function validateSettings(raw: unknown): Settings {
   if (typeof raw !== "object" || raw === null) return DEFAULT_SETTINGS;
@@ -55,6 +67,7 @@ export function validateSettings(raw: unknown): Settings {
       : DEFAULT_SETTINGS.maxNestedDepth;
   return {
     retentionLimit: retention,
+    framePrefix: parseFramePrefix(record.framePrefix),
     autoDecode: record.autoDecode !== false,
     reusePickedSchema: record.reusePickedSchema !== false,
     autoDecodeRules: validateRules(record.autoDecodeRules),
