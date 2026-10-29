@@ -22,7 +22,7 @@ npm ci
 # 3. Run the unit tests
 npm test
 
-# 4. Build the loadable extension into dist/extension
+# 4. Build the loadable extension into dist/proto-inspector-<version>
 npm run build
 
 # 5. Optional: produce dist/proto-inspector-<version>.zip
@@ -33,7 +33,7 @@ Then in Chrome:
 
 1. Open `chrome://extensions`.
 2. Enable **Developer mode**.
-3. Click **Load unpacked** and select `dist/extension` (not the repository root).
+3. Click **Load unpacked** and select `dist/proto-inspector-<version>` (not the repository root).
 4. Open the site you want to inspect.
 5. Open DevTools (**F12**), and select the **Proto Inspector** panel.
 6. Click **Start capture**.
@@ -393,7 +393,7 @@ src/
   storage/                Settings and schema persistence with validation
   schemas/                Sample .proto files
 scripts/
-  build.mjs               esbuild bundle → dist/extension (+ icons, manifest check)
+  build.mjs               esbuild bundle → dist/proto-inspector-<version>/ (+ icons, manifest check)
   package.mjs             ZIP writer → dist/proto-inspector-<version>.zip
   sample-server.mjs       Local WebSocket + protobuf test target (no dependencies)
   make-fixtures.mjs       Regenerates tests/fixtures/payloads.json
@@ -435,7 +435,7 @@ npx @puppeteer/browsers install chrome@stable --path "$TMPDIR/cft"
 | --- | --- |
 | `tsc --noEmit` | passes |
 | Unit tests | **203 passed**, 7 files |
-| `npm run build` | produces `dist/extension`; manifest references verified |
+| `npm run build` | produces `dist/proto-inspector-<version>`; manifest references verified |
 | `npm run package` | ZIP integrity verified, 13 files |
 | `npm audit` | 0 vulnerabilities |
 | e2e `panel-smoke` | **82/82 checks passed** — capture, send/receive counts, schema decode, enum rendering, wire view, hex view, text frames, search filter, settings persistence, malformed frames, CSP enforcement, no-guess behaviour, schema reuse by shape, auto decode rules, rule import/export, settings tabs, folder schema loading with `.meta` skipped, opcode-prefix detection and schema-declared types, status filter, detail General tab, autoscroll, searchable dropdown, tab switching, pause/resume, JSON export, clear, stop |

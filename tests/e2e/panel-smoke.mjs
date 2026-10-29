@@ -22,7 +22,8 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
-const extensionDir = path.join(root, "dist", "extension");
+const { version } = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
+const extensionDir = path.join(root, "dist", `proto-inspector-${version}`);
 const PORT = 8799;
 const PAGE_URL = `http://127.0.0.1:${PORT}/`;
 
@@ -59,7 +60,7 @@ async function waitFor(predicate, timeoutMs, label) {
 
 async function main() {
   if (!fs.existsSync(path.join(extensionDir, "manifest.json"))) {
-    throw new Error("dist/extension is missing; run `npm run build` first");
+    throw new Error(`dist/proto-inspector-${version} is missing; run \`npm run build\` first`);
   }
 
   const server = spawn(process.execPath, [path.join(root, "scripts", "sample-server.mjs")], {

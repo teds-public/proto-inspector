@@ -14,7 +14,8 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
-const extensionDir = path.join(root, "dist", "extension");
+const { version } = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
+const extensionDir = path.join(root, "dist", `proto-inspector-${version}`);
 const PORT = 8801;
 
 function findChrome() {

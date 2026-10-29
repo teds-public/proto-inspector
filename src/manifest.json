@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Proto Inspector",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Inspect WebSocket traffic and decode Protobuf payloads locally in a DevTools panel.",
   "minimum_chrome_version": "116",
   "devtools_page": "devtools/devtools.html",

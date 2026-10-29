@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Reproducible build: bundles the entry points with esbuild and copies static
- * assets into `dist/extension`, which is the directory to load unpacked.
+ * assets into `dist/proto-inspector-<version>`, which is the directory to load unpacked.
  */
 
 import * as esbuild from "esbuild";
@@ -12,7 +12,8 @@ import { deflateSync } from "node:zlib";
 import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const outdir = path.join(root, "dist", "extension");
+const { version } = JSON.parse(await readFile(path.join(root, "package.json"), "utf8"));
+const outdir = path.join(root, "dist", `proto-inspector-${version}`);
 const watch = process.argv.includes("--watch");
 
 const ENTRIES = {

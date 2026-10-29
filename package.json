@@ -1,6 +1,6 @@
 {
   "name": "proto-inspector",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "description": "Chrome DevTools extension for real-time inspection and decoding of Protobuf WebSocket traffic.",
   "type": "module",

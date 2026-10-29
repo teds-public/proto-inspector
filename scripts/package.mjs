@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
- * Zips dist/extension into dist/proto-inspector-<version>.zip using a small,
- * dependency-free ZIP writer (deflate via node:zlib).
+ * Zips dist/proto-inspector-<version> into dist/proto-inspector-<version>.zip
+ * using a small, dependency-free ZIP writer (deflate via node:zlib).
  */
 
 import { readdir, readFile, stat, writeFile, mkdir } from "node:fs/promises";
@@ -10,8 +10,12 @@ import { deflateRawSync, crc32 as zlibCrc32 } from "node:zlib";
 import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const source = path.join(root, "dist", "extension");
+const { version } = JSON.parse(await readFile(path.join(root, "package.json"), "utf8"));
+const source = path.join(root, "dist", `proto-inspector-${version}`);
 const manifest = JSON.parse(await readFile(path.join(source, "manifest.json"), "utf8"));
+if (manifest.version !== version) {
+  throw new Error(`manifest version ${manifest.version} does not match package version ${version}`);
+}
 const target = path.join(root, "dist", `proto-inspector-${manifest.version}.zip`);
 
 const CRC_TABLE = (() => {
